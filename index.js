@@ -4,8 +4,7 @@ import fs from "fs";
 /**
  * Node's global fetch has NO default timeout — an unresponsive server on
  * the other end (odds API, weather API) would hang the request forever
- * with no error, which looks exactly like "the app just stopped working."
- * Every outbound fetch in this app goes through this instead.
+ * with no error. Every outbound fetch in this app goes through this instead.
  */
 async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
   const controller = new AbortController();
@@ -325,14 +324,12 @@ function normalizeEventOdds(eventData, sportKey, sportLabel) {
       const opposite = side === "Over" ? sides["Under"] : side === "Under" ? sides["Over"] : null;
       const best = quotes.reduce((a, b) => (a.american > b.american ? a : b));
 
-      let trueProb;
-      let devigged = false;
+      const pairedTrueProbs = [];
       if (!oneSided && opposite && opposite.length) {
         // Only pair a book's price against THAT SAME book's opposite-side price.
         // Pairing across different books (the old fallback) can mismatch a
         // generous book's price against a stingy book's opposite price and
         // produce a fabricated "edge" that isn't real.
-        const pairedTrueProbs = [];
         for (const q of quotes) {
           const oppForBook = opposite.find((o) => o.book === q.book);
           if (!oppForBook) continue;
@@ -343,17 +340,18 @@ function normalizeEventOdds(eventData, sportKey, sportLabel) {
           // rather than let it produce a fabricated probability.
           if (overround < 0.98 || overround > 1.3) continue;
           const weight = SHARP_BOOKS.has(q.book) ? SHARP_BOOK_WEIGHT : 1;
-          pairedTrueProbs.push({ trueProbA, weight });
+          pairedTrueProbs.push({ trueProbA, weight, book: q.book });
         }
-        if (pairedTrueProbs.length) {
-          const totalWeight = pairedTrueProbs.reduce((a, p) => a + p.weight, 0);
-          trueProb = pairedTrueProbs.reduce((a, p) => a + p.trueProbA * p.weight, 0) / totalWeight;
-          devigged = true;
-        } else {
-          // No single book quoted both sides — can't de-vig reliably, fall back to raw implied.
-          trueProb = americanToImpliedProb(best.american);
-        }
+      }
+
+      let trueProb;
+      let devigged = false;
+      if (pairedTrueProbs.length) {
+        const totalWeight = pairedTrueProbs.reduce((a, p) => a + p.weight, 0);
+        trueProb = pairedTrueProbs.reduce((a, p) => a + p.trueProbA * p.weight, 0) / totalWeight;
+        devigged = true;
       } else {
+        // No single book quoted both sides — can't de-vig reliably, fall back to raw implied.
         trueProb = americanToImpliedProb(best.american);
       }
 
@@ -368,6 +366,28 @@ function normalizeEventOdds(eventData, sportKey, sportLabel) {
         suspect = true;
       }
 
+      // Market Agreement Score (0-100): how tightly the individual books'
+      // de-vigged probabilities cluster together. Needs 2+ book-pairs to
+      // mean anything — with fewer, we report null rather than fabricate
+      // a score from a single data point.
+      let agreementScore = null;
+      if (pairedTrueProbs.length >= 2) {
+        const probs = pairedTrueProbs.map((p) => p.trueProbA);
+        const mean = probs.reduce((a, b) => a + b, 0) / probs.length;
+        const variance = probs.reduce((a, p) => a + (p - mean) ** 2, 0) / probs.length;
+        const stddev = Math.sqrt(variance);
+        // Heuristic scale, not statistically validated: ~1pp stddev -> 90,
+        // ~5pp -> 50, ~10pp+ -> near 0. Tune against real data over time.
+        agreementScore = Math.max(0, Math.min(100, Math.round(100 - stddev * 1000)));
+      }
+
+      const confidenceTier = quotes.length >= 4 ? "high" : quotes.length === 3 ? "medium" : "low";
+      const decimalBest = americanToDecimal(best.american);
+      // EV = (fair probability x decimal payout) - 1, against the actual best price available.
+      const legEV = trueProb * decimalBest - 1;
+      const fairOdds = trueProb > 0 && trueProb < 1 ? decimalToAmerican(1 / trueProb) : null;
+      const sharpBookUsed = pairedTrueProbs.some((p) => SHARP_BOOKS.has(p.book));
+
       legs.push({
         id: `${eventId}:${market}:${player}:${side}:${point}`,
         sport: sportKey, sportLabel, eventId, commenceTime: commence_time,
@@ -377,10 +397,68 @@ function normalizeEventOdds(eventData, sportKey, sportLabel) {
         impliedProbBest: impliedBest,
         trueProb, devigged, suspect,
         edge: trueProb - impliedBest,
+        agreementScore, confidenceTier, fairOdds, legEV, sharpBookUsed,
       });
     }
   }
   return legs;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   PICK SCORE (0-100)
+   A transparent, auditable composite — every component and its point cap
+   is listed below so this never becomes a black box. This score has NOT
+   been validated against real outcomes yet; it's a ranking aid built from
+   reasonable heuristics, not a claim about win rate. The track record page
+   is what actually tells you whether high-scored picks perform better.
+──────────────────────────────────────────────────────────────────────── */
+
+const PICK_SCORE_TIERS = [
+  { min: 90, label: "Elite Value" },
+  { min: 80, label: "Strong Value" },
+  { min: 70, label: "Moderate Value" },
+  { min: 0, label: "Below threshold" },
+];
+
+function pickScoreTier(score) {
+  return PICK_SCORE_TIERS.find((t) => score >= t.min).label;
+}
+
+function computePickScore(leg) {
+  const breakdown = {};
+
+  // EV (0-40): the single biggest factor — this is a value scanner, not a
+  // probability scanner. legEV is a fraction (0.05 = +5%).
+  breakdown.ev = Math.max(0, Math.min(40, Math.round((leg.legEV * 100 + 10) * 2)));
+
+  // No-vig probability sanity (0-15): rewards mid-range probabilities.
+  // Extreme long shots and near-locks are historically harder to price
+  // accurately, independent of what the EV math says.
+  breakdown.probabilityRange = Math.max(
+    0,
+    Math.round(15 * (1 - Math.abs(leg.trueProb - 0.4) / 0.4))
+  );
+
+  // Market agreement (0-15): books clustering tightly = more trustworthy
+  // consensus. No data (fewer than 2 book-pairs) earns zero, not a guess.
+  breakdown.agreement = leg.agreementScore != null ? Math.round(leg.agreementScore * 0.15) : 0;
+
+  // Sample size (0-10): more books quoting it = less likely to be a fluke line.
+  breakdown.bookCount = Math.round((Math.min(leg.numBooks, 6) / 6) * 10);
+
+  // Sharp-book presence (0-10): binary bonus if a lower-vig book contributed.
+  breakdown.sharpBook = leg.sharpBookUsed ? 10 : 0;
+
+  // Line movement (0-5): small bonus for a line moving toward this side,
+  // deliberately capped low since this signal is unvalidated.
+  breakdown.movement = leg.movement && leg.movement.significant && leg.movement.deltaProb > 0 ? 5 : 0;
+
+  // Data quality (0-5): was this leg actually de-vigged cleanly, with no
+  // suspect/rejected pairings along the way?
+  breakdown.dataQuality = leg.devigged && !leg.suspect ? 5 : 0;
+
+  const score = Object.values(breakdown).reduce((a, b) => a + b, 0);
+  return { score, tier: pickScoreTier(score), breakdown };
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -469,6 +547,9 @@ const DEFAULT_OPTIONS = {
   targetAmericanOdds: 1000, toleranceLow: 700, toleranceHigh: 1600,
   minLegs: 3, maxLegs: 6, minBooksPerLeg: 2,
   minTrueProb: 0.12, maxTrueProb: 0.72,
+  minEV: 0,          // must be genuinely +EV by default — this is a value scanner, not a parlay generator
+  minPickScore: 70,  // "Moderate Value" floor — below this, don't auto-recommend
+  minAgreement: 0,   // 0 = not enforced by default (many legs lack 2+ book-pairs to even measure it)
   allowSameEventLegs: false, iterations: 8000, resultCount: 10,
 };
 
@@ -497,9 +578,31 @@ function pickWeightedByEdge(pool, rng) {
 function buildParlays(allLegs, options = {}) {
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const rng = Math.random;
+
+  // Attach Pick Score to every leg first (needs movement data already applied by the caller).
+  for (const l of allLegs) {
+    if (!l.pickScore) l.pickScore = computePickScore(l);
+  }
+
   const pool = allLegs.filter(
-    (l) => !l.suspect && l.numBooks >= opts.minBooksPerLeg && l.trueProb >= opts.minTrueProb && l.trueProb <= opts.maxTrueProb
+    (l) =>
+      !l.suspect &&
+      l.numBooks >= opts.minBooksPerLeg &&
+      l.trueProb >= opts.minTrueProb &&
+      l.trueProb <= opts.maxTrueProb &&
+      l.legEV >= opts.minEV &&
+      l.pickScore.score >= opts.minPickScore &&
+      (opts.minAgreement <= 0 || (l.agreementScore != null && l.agreementScore >= opts.minAgreement))
   );
+
+  if (pool.length < opts.minLegs) {
+    return {
+      parlays: [],
+      qualifyingLegsCount: pool.length,
+      poolSizeBeforeFilters: allLegs.length,
+      reason: "insufficient_qualifying_legs",
+    };
+  }
 
   const seen = new Set();
   const results = [];
@@ -536,6 +639,7 @@ function buildParlays(allLegs, options = {}) {
       combinedAmerican: american, combinedDecimal: decimal,
       trueProbability: trueProb, evPerDollar: ev,
       avgBooksPerLeg: combo.reduce((a, l) => a + l.numBooks, 0) / combo.length,
+      avgPickScore: Math.round(combo.reduce((a, l) => a + l.pickScore.score, 0) / combo.length),
       allDevigged: combo.every((l) => l.devigged),
     });
   }
@@ -545,7 +649,12 @@ function buildParlays(allLegs, options = {}) {
     return Math.abs(a.combinedAmerican - opts.targetAmericanOdds) - Math.abs(b.combinedAmerican - opts.targetAmericanOdds);
   });
 
-  return results.slice(0, opts.resultCount);
+  return {
+    parlays: results.slice(0, opts.resultCount),
+    qualifyingLegsCount: pool.length,
+    poolSizeBeforeFilters: allLegs.length,
+    reason: results.length ? null : "no_combo_in_odds_window",
+  };
 }
 
 function marketLabel(marketKey) {
@@ -555,10 +664,10 @@ function marketLabel(marketKey) {
 function explainParlay(parlay) {
   const lines = [];
   lines.push(
-    `${parlay.legs.length}-leg parlay at +${parlay.combinedAmerican} (fair-ish odds ${(1 / parlay.trueProbability).toFixed(1)}:1 based on de-vigged leg probabilities).`
+    `${parlay.legs.length}-leg parlay at +${parlay.combinedAmerican} (fair-ish odds ${(1 / parlay.trueProbability).toFixed(1)}:1 based on de-vigged leg probabilities). Avg Pick Score: ${parlay.avgPickScore}/100.`
   );
   lines.push(
-    `Estimated true hit probability: ${(parlay.trueProbability * 100).toFixed(1)}%. Modeled EV: ${parlay.evPerDollar >= 0 ? "+" : ""}${(parlay.evPerDollar * 100).toFixed(1)}% per $1 staked — ${parlay.evPerDollar >= -0.05 ? "close to fair for a longshot parlay" : "still carries the standard sportsbook hold; treat as entertainment-weighted, not a value bet"}.`
+    `Estimated true hit probability: ${(parlay.trueProbability * 100).toFixed(1)}%. Modeled EV: ${parlay.evPerDollar >= 0 ? "+" : ""}${(parlay.evPerDollar * 100).toFixed(1)}% per $1 staked — ${parlay.evPerDollar >= -0.05 ? "close to fair for a longshot parlay" : "still carries the standard sportsbook hold; treat as entertainment-weighted, not a value bet"}. Pick Score is a ranking aid built from de-vig quality, agreement, and EV — it has not yet been validated against real outcomes (check the track record page for that).`
   );
   for (const leg of parlay.legs) {
     const edgePct = (leg.edge * 100).toFixed(1);
@@ -575,10 +684,11 @@ function explainParlay(parlay) {
     const weatherText = leg.weather
       ? ` Game-time weather: ${Math.round(leg.weather.tempF)}°F, wind ${Math.round(leg.weather.windMph)}mph, ${Math.round(leg.weather.precipProb)}% precip chance — outdoor venue (informational only, not factored into the probability above).`
       : "";
+    const agreementText = leg.agreementScore != null ? `${leg.agreementScore}/100` : "n/a (fewer than 2 books quoted both sides)";
     lines.push(
-      `• ${leg.player} ${leg.side} ${leg.point ?? ""} ${marketLabel(leg.market)} (${leg.matchup}) — best price ${leg.bestAmerican > 0 ? "+" : ""}${leg.bestAmerican} at ${leg.bestBook}, ${leg.numBooks} books quoting it${
+      `• ${leg.player} ${leg.side} ${leg.point ?? ""} ${marketLabel(leg.market)} (${leg.matchup}) — Pick Score ${leg.pickScore.score}/100 (${leg.pickScore.tier}), confidence: ${leg.confidenceTier} (${leg.numBooks} books). Best price ${leg.bestAmerican > 0 ? "+" : ""}${leg.bestAmerican} at ${leg.bestBook}${
         leg.devigged
-          ? `, de-vigged true probability ${(leg.trueProb * 100).toFixed(1)}% (${edgePct}% ${leg.edge >= 0 ? "better" : "worse"} than the market's own implied price)`
+          ? `, fair probability ${(leg.trueProb * 100).toFixed(1)}% / fair odds ${leg.fairOdds > 0 ? "+" : ""}${leg.fairOdds}, leg EV ${leg.legEV >= 0 ? "+" : ""}${(leg.legEV * 100).toFixed(1)}%, market agreement ${agreementText}`
           : " (single-sided market — probability is vig-inclusive, not de-vigged)"
       }.${movementText}${weatherText}`
     );
@@ -738,7 +848,22 @@ app.get("/api/scan", async (req, res) => {
   const requestedSports = (req.query.sports ? req.query.sports.split(",") : Object.keys(SPORTS)).filter((s) => SPORTS[s]);
   const targetOdds = Number(req.query.target) || 1000;
   const forceRefresh = req.query.refresh === "true";
-  const cacheKey = `${requestedSports.sort().join(",")}::${targetOdds}`;
+
+  // Configurable quality filters (section 8 of the spec) — all optional,
+  // defaults favor quality over quantity per the "do not lower the
+  // standards just to generate a parlay" requirement.
+  const filterOpts = {
+    targetAmericanOdds: targetOdds,
+    minEV: req.query.minEV != null ? Number(req.query.minEV) : undefined,
+    minPickScore: req.query.minPickScore != null ? Number(req.query.minPickScore) : undefined,
+    minAgreement: req.query.minAgreement != null ? Number(req.query.minAgreement) : undefined,
+    minBooksPerLeg: req.query.minBooks != null ? Number(req.query.minBooks) : undefined,
+    minTrueProb: req.query.minProb != null ? Number(req.query.minProb) : undefined,
+    maxTrueProb: req.query.maxProb != null ? Number(req.query.maxProb) : undefined,
+  };
+  Object.keys(filterOpts).forEach((k) => filterOpts[k] === undefined && delete filterOpts[k]);
+
+  const cacheKey = `${requestedSports.sort().join(",")}::${JSON.stringify(filterOpts)}`;
   const isFresh = cache.key === cacheKey && Date.now() - cache.timestamp < CACHE_TTL_MS;
 
   if (isFresh && !forceRefresh) return res.json({ ...cache.data, cached: true });
@@ -755,10 +880,25 @@ app.get("/api/scan", async (req, res) => {
           : "No player-prop legs came back for the requested sports right now (off-slate day, or books haven't posted props yet).",
       });
     }
-    const parlays = buildParlays(allLegs, { targetAmericanOdds: targetOdds });
-    const withExplanations = parlays.map((p) => ({ ...p, explanation: explainParlay(p) }));
-    logPicks(parlays);
-    const payload = { parlays: withExplanations, scanned: { ...scanned, legsFound: allLegs.length }, generatedAt: new Date().toISOString() };
+    const buildResult = buildParlays(allLegs, filterOpts);
+    const withExplanations = buildResult.parlays.map((p) => ({ ...p, explanation: explainParlay(p) }));
+    logPicks(buildResult.parlays);
+
+    let message = null;
+    if (buildResult.reason === "insufficient_qualifying_legs") {
+      message = `NO QUALIFYING PARLAY — only ${buildResult.qualifyingLegsCount} of ${buildResult.poolSizeBeforeFilters} scanned props met your current quality thresholds (need at least 3). Loosen filters (lower Min Pick Score or Min EV) if you want to see more, or check back — the standards aren't being lowered automatically to force a result.`;
+    } else if (buildResult.reason === "no_combo_in_odds_window") {
+      message = `NO QUALIFYING PARLAY — ${buildResult.qualifyingLegsCount} props qualified on quality, but none combined into your target odds window (+${filterOpts.targetAmericanOdds ?? targetOdds} range). Try widening the target odds.`;
+    }
+
+    const payload = {
+      parlays: withExplanations,
+      scanned: { ...scanned, legsFound: allLegs.length },
+      qualifyingLegsCount: buildResult.qualifyingLegsCount,
+      poolSizeBeforeFilters: buildResult.poolSizeBeforeFilters,
+      message,
+      generatedAt: new Date().toISOString(),
+    };
     cache = { key: cacheKey, timestamp: Date.now(), data: payload };
     res.json({ ...payload, cached: false });
   } catch (err) {
@@ -823,90 +963,78 @@ const DASHBOARD_HTML = `<!doctype html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Longshot Board</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23071310'/%3E%3Cpolyline points='6,20 12,14 16,17 26,7' fill='none' stroke='%233ddc84' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='26' cy='7' r='2.2' fill='%233ddc84'/%3E%3C/svg%3E" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1720'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='20' font-weight='700' fill='%23f0a84e' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
 <style>
 :root{
-  /* grounded in old phosphor-CRT trading terminals: green signal on a
-     near-black screen that actually has hue in it, not neutral grey-black */
-  --ink:#071310; --ink-raised:#0f1f19; --ink-raised-2:#15281f;
-  --hairline:#1f3a2c; --hairline-bright:#2f5a41;
-  --green:#3ddc84; --green-deep:#1f8f52; --green-dim:#5c8f74;
-  --red:#e08579;
-  --gold:#d4af37; --silver:#adb8b6; --bronze:#c9834a;
-  --text:#eaf3ea; --text-dim:#7ea08c;
+  --ink:#0d1720; --ink-raised:#15222c; --ink-raised-2:#1b2b38;
+  --hairline:#24343f; --hairline-bright:#37505f;
+  --amber:#f0a84e; --amber-deep:#b97a2e; --amber-dim:#8a6640;
+  --green:#7fcf9e; --red:#d97a6c;
+  --text:#f1ece0; --text-dim:#8fa1ab;
   --serif:"Fraunces",Georgia,serif; --sans:"IBM Plex Sans",system-ui,sans-serif; --mono:"IBM Plex Mono",monospace;
 }
 *{box-sizing:border-box}
 html{color-scheme:dark}
-body{margin:0;background:var(--ink);color:var(--text);font-family:var(--mono);line-height:1.5;-webkit-font-smoothing:antialiased}
-a{color:var(--green)}
-:focus-visible{outline:2px solid var(--green);outline-offset:2px}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:var(--amber)}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
 .board{max-width:900px;margin:0 auto;padding:40px 20px 90px}
 
+/* header: masthead + ticker line, no isolated giant stat block */
 .masthead{display:flex;align-items:center;gap:12px}
-.mark{width:34px;height:34px;flex-shrink:0;border-radius:7px;background:var(--ink-raised);border:1px solid var(--hairline-bright);display:flex;align-items:center;justify-content:center}
-.mark svg{width:20px;height:20px}
-h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.7rem,4.6vw,2.35rem);margin:0;letter-spacing:-.01em;font-family:var(--serif)}
-.ticker{margin:14px 0 4px;color:var(--text-dim);font-size:.84rem;display:flex;flex-wrap:wrap;gap:6px 14px}
-.ticker b{color:var(--green);font-weight:600}
-.dek{color:var(--text-dim);max-width:58ch;margin:14px 0 0;font-size:.95rem;font-family:var(--sans)}
+.mark{width:34px;height:34px;flex-shrink:0;border-radius:7px;background:linear-gradient(155deg,var(--amber) 0%,var(--amber-deep) 100%);display:flex;align-items:center;justify-content:center;font-family:var(--serif);font-weight:700;font-size:1.15rem;color:#12202a}
+h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.7rem,4.6vw,2.35rem);margin:0;letter-spacing:-.01em}
+.ticker{margin:14px 0 4px;color:var(--text-dim);font-size:.86rem;font-family:var(--mono);display:flex;flex-wrap:wrap;gap:6px 14px}
+.ticker b{color:var(--amber);font-weight:600}
+.dek{color:var(--text-dim);max-width:58ch;margin:14px 0 0;font-size:.95rem}
 .dek a{white-space:nowrap}
 
+/* controls: command-bar feel */
 .controls{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-top:26px;padding:16px 18px;background:var(--ink-raised);border:1px solid var(--hairline);border-radius:10px}
 .control-group{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.sport-chip{position:relative;display:inline-flex;align-items:center;gap:7px;padding:6px 13px 6px 11px;border:1px solid var(--hairline-bright);border-radius:99px;font-size:.8rem;cursor:pointer;color:var(--text-dim);user-select:none;background:transparent;transition:background .15s,color .15s,border-color .15s}
+.sport-chip{position:relative;display:inline-flex;align-items:center;gap:7px;padding:6px 13px 6px 11px;border:1px solid var(--hairline-bright);border-radius:99px;font-size:.82rem;cursor:pointer;color:var(--text-dim);user-select:none;background:transparent;transition:background .15s,color .15s,border-color .15s}
 .sport-chip .dot{width:6px;height:6px;border-radius:50%;background:var(--hairline-bright);transition:background .15s}
-.sport-chip.active{border-color:var(--green-deep);color:var(--text);background:rgba(61,220,132,.1)}
-.sport-chip.active .dot{background:var(--green);box-shadow:0 0 6px rgba(61,220,132,.7)}
+.sport-chip.active{border-color:var(--amber-deep);color:var(--text);background:rgba(240,168,78,.12)}
+.sport-chip.active .dot{background:var(--amber)}
 .control-target{display:flex;align-items:center;gap:8px}
-.control-target label{font-size:.78rem;color:var(--text-dim)}
-#target-odds{background:var(--ink);border:1px solid var(--hairline-bright);color:var(--green);font-family:var(--mono);font-size:.86rem;padding:7px 10px;border-radius:6px;width:88px}
-.scan-btn{background:var(--green);color:#07130d;border:none;font-family:var(--sans);font-weight:600;font-size:.86rem;padding:10px 20px;border-radius:7px;cursor:pointer;margin-left:auto;box-shadow:0 1px 0 rgba(0,0,0,.3),0 0 0 1px rgba(61,220,132,.4);transition:transform .1s,box-shadow .15s}
-.scan-btn:hover{box-shadow:0 1px 0 rgba(0,0,0,.3),0 0 22px rgba(61,220,132,.4),0 0 0 1px rgba(61,220,132,.6)}
+.control-target label{font-size:.8rem;color:var(--text-dim)}
+#target-odds{background:var(--ink);border:1px solid var(--hairline-bright);color:var(--amber);font-family:var(--mono);font-size:.88rem;padding:7px 10px;border-radius:6px;width:88px}
+.scan-btn{background:var(--amber);color:#17222a;border:none;font-family:var(--sans);font-weight:600;font-size:.88rem;padding:10px 20px;border-radius:7px;cursor:pointer;margin-left:auto;box-shadow:0 1px 0 rgba(0,0,0,.2),0 0 0 1px rgba(240,168,78,.35);transition:transform .1s,box-shadow .15s}
+.scan-btn:hover{box-shadow:0 1px 0 rgba(0,0,0,.2),0 0 20px rgba(240,168,78,.35),0 0 0 1px rgba(240,168,78,.5)}
 .scan-btn:active{transform:translateY(1px)}
-.scan-btn:disabled{opacity:.5;cursor:progress;box-shadow:none}
-.scan-meta{color:var(--text-dim);font-size:.74rem}
+.scan-btn:disabled{opacity:.55;cursor:progress;box-shadow:none}
+.scan-meta{color:var(--text-dim);font-size:.76rem;font-family:var(--mono)}
 
 .results{margin-top:8px}
-.empty-state{color:var(--text-dim);padding:56px 20px;text-align:center;border:1px dashed var(--hairline);border-radius:10px;margin-top:20px;font-family:var(--sans)}
+.empty-state{color:var(--text-dim);padding:56px 20px;text-align:center;border:1px dashed var(--hairline);border-radius:10px;margin-top:20px}
 
-.parlay-row{display:flex;gap:18px;padding:20px 4px 20px 18px;border-left:2px solid var(--hairline);border-bottom:1px solid var(--hairline)}
-.parlay-row.gold{border-left:3px solid var(--gold);background:linear-gradient(90deg,rgba(212,175,55,.09),transparent 60%)}
-.parlay-row.silver{border-left:3px solid var(--silver);background:linear-gradient(90deg,rgba(173,184,182,.05),transparent 60%)}
-.parlay-row.bronze{border-left:3px solid var(--bronze);background:linear-gradient(90deg,rgba(201,131,74,.06),transparent 60%)}
-.rank{font-weight:600;font-size:.92rem;color:var(--text-dim);width:26px;flex-shrink:0;padding-top:3px}
-.parlay-row.gold .rank{color:var(--gold)}
-.parlay-row.silver .rank{color:var(--silver)}
-.parlay-row.bronze .rank{color:var(--bronze)}
+/* result rows: left accent bar, not identical bordered cards */
+.parlay-row{display:flex;gap:18px;padding:20px 4px 20px 18px;border-left:2px solid var(--hairline);border-bottom:1px solid var(--hairline);position:relative}
+.parlay-row.top{border-left:3px solid var(--amber);background:linear-gradient(90deg,rgba(240,168,78,.07),transparent 60%)}
+.rank{font-family:var(--mono);font-weight:600;font-size:.95rem;color:var(--text-dim);width:26px;flex-shrink:0;padding-top:3px}
+.parlay-row.top .rank{color:var(--amber)}
 .parlay-body{flex:1;min-width:0}
-h3{font-family:var(--serif);font-weight:600;font-size:1.08rem;margin:0 0 10px;color:var(--text)}
-.parlay-row.gold h3{font-size:1.3rem}
-.leg-list{list-style:none;margin:0 0 10px;padding:0;display:flex;flex-direction:column;gap:3px;font-family:var(--sans)}
-.leg-list li{font-size:.85rem;color:var(--text-dim);display:flex;align-items:center;gap:6px}
+.parlay-row.top h3{font-size:1.35rem}
+h3{font-family:var(--serif);font-weight:600;font-size:1.1rem;margin:0 0 10px;color:var(--text)}
+.leg-list{list-style:none;margin:0 0 10px;padding:0;display:flex;flex-direction:column;gap:3px}
+.leg-list li{font-size:.85rem;color:var(--text-dim)}
 .leg-list li b{color:var(--text);font-weight:500}
-.side-arrow{flex-shrink:0}
-.side-arrow.up path{fill:var(--green)}
-.side-arrow.down path{fill:var(--red)}
-.detail-line{margin-bottom:8px}
-.detail-line:last-child{margin-bottom:0}
-.detail-line.leg{display:flex;gap:7px;align-items:flex-start}
-.detail-line.leg .side-arrow{margin-top:4px}
-.toggle-detail{background:none;border:none;color:var(--green);font-size:.79rem;cursor:pointer;padding:0;font-family:var(--sans);font-weight:500}
-.parlay-detail{display:none;margin-top:12px;padding:14px 16px;background:var(--ink-raised);border-radius:8px;border:1px solid var(--hairline);font-size:.83rem;color:var(--text-dim);font-family:var(--sans)}
+.toggle-detail{background:none;border:none;color:var(--amber);font-size:.8rem;cursor:pointer;padding:0;font-family:var(--sans);font-weight:500}
+.parlay-detail{display:none;margin-top:12px;padding:14px 16px;background:var(--ink-raised);border-radius:8px;border:1px solid var(--hairline);white-space:pre-line;font-size:.84rem;color:var(--text-dim)}
 .parlay-detail.open{display:block}
 .parlay-figures{text-align:right;flex-shrink:0;padding-top:2px}
-.odds-figure{font-weight:600;font-size:1.28rem;color:var(--green)}
-.parlay-row.gold .odds-figure{font-size:1.65rem;text-shadow:0 0 18px rgba(61,220,132,.35)}
-.ev-tag{display:inline-block;margin-top:6px;font-size:.71rem;padding:2px 7px;border-radius:4px}
-.ev-tag.pos{color:var(--green);background:rgba(61,220,132,.1)}
-.ev-tag.neg{color:var(--red);background:rgba(224,133,121,.1)}
+.odds-figure{font-family:var(--mono);font-weight:600;font-size:1.3rem;color:var(--amber)}
+.parlay-row.top .odds-figure{font-size:1.7rem}
+.ev-tag{display:inline-block;margin-top:6px;font-size:.72rem;font-family:var(--mono);padding:2px 7px;border-radius:4px}
+.ev-tag.pos{color:var(--green);background:rgba(127,207,158,.1)}
+.ev-tag.neg{color:var(--red);background:rgba(217,122,108,.1)}
 
-.board-foot{margin-top:36px;color:var(--text-dim);font-size:.76rem;max-width:65ch;line-height:1.6;font-family:var(--sans)}
+.board-foot{margin-top:36px;color:var(--text-dim);font-size:.78rem;max-width:65ch;line-height:1.6}
 
 @media (max-width:620px){
   .parlay-row{padding-left:12px;gap:12px}
@@ -915,14 +1043,9 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.08rem;margin:0 0 10px;co
 </style>
 </head>
 <body>
-<div id="js-canary" style="background:#c0392b;color:#fff;padding:16px;font-family:monospace;font-size:14px;text-align:center;font-weight:bold">JAVASCRIPT DID NOT RUN ON THIS PAGE</div>
-<script>document.getElementById('js-canary').remove();</script>
 <div class="board">
 <header>
-<div class="masthead">
-<div class="mark"><svg viewBox="0 0 32 32" fill="none"><polyline points="6,20 12,14 16,17 26,7" stroke="#3ddc84" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="26" cy="7" r="2.2" fill="#3ddc84"/></svg></div>
-<h1>Longshot Board</h1>
-</div>
+<div class="masthead"><div class="mark">L</div><h1>Longshot Board</h1></div>
 <p class="ticker" id="ticker-line"><span>Live player-prop scan · press Scan market to start</span></p>
 <p class="dek">Pulls live prop lines, de-vigs every two-sided market for a true probability estimate, then ranks parlays near your target price by modeled edge — not by which one simply pays the most. <a href="/history">Track record & grade picks →</a></p>
 </header>
@@ -930,6 +1053,7 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.08rem;margin:0 0 10px;co
 <section class="controls">
 <div class="control-group" id="sport-toggles" aria-label="Sports to include"></div>
 <div class="control-target"><label for="target-odds">Target</label><input type="text" id="target-odds" value="+1000" /></div>
+<div class="control-target"><label for="min-score">Min Pick Score</label><input type="text" id="min-score" value="70" style="width:44px" /></div>
 <button id="scan-btn" class="scan-btn">Scan market</button>
 </section>
 <p class="scan-meta" id="scan-meta" style="margin-top:10px"></p>
@@ -940,10 +1064,7 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.08rem;margin:0 0 10px;co
 </div>
 
 <script>
-window.onerror=function(msg,url,line,col,error){
-  document.body.insertAdjacentHTML('afterbegin','<div style="background:#c0392b;color:#fff;padding:14px;font-family:monospace;font-size:13px;white-space:pre-wrap;position:relative;z-index:999">JS ERROR: '+msg+'\\nline '+line+' col '+col+'\\n'+(error&&error.stack?error.stack:'')+'</div>');
-};
-const sportTogglesEl=document.getElementById("sport-toggles"),resultsEl=document.getElementById("results"),scanBtn=document.getElementById("scan-btn"),scanMetaEl=document.getElementById("scan-meta"),tickerEl=document.getElementById("ticker-line"),targetOddsInput=document.getElementById("target-odds");
+const sportTogglesEl=document.getElementById("sport-toggles"),resultsEl=document.getElementById("results"),scanBtn=document.getElementById("scan-btn"),scanMetaEl=document.getElementById("scan-meta"),tickerEl=document.getElementById("ticker-line"),targetOddsInput=document.getElementById("target-odds"),minScoreInput=document.getElementById("min-score");
 let activeSports=new Set();
 
 async function loadSports(){
@@ -966,24 +1087,6 @@ async function loadSports(){
 function parseTargetOdds(raw){const n=parseInt(raw.replace(/[^0-9-]/g,""),10);return Number.isFinite(n)?Math.abs(n):1000}
 function formatAmerican(n){return n>0?"+"+n:""+n}
 function escapeHtml(str){const div=document.createElement("div");div.textContent=str;return div.innerHTML}
-function sideArrow(side){
-  const isUp=side!=="Under"; // Over and Yes both read as "betting toward it happening" -> up
-  const path=isUp?"M6 1 L11 9 L1 9 Z":"M6 9 L1 1 L11 1 Z";
-  return '<svg class="side-arrow '+(isUp?"up":"down")+'" viewBox="0 0 12 10" width="9" height="8"><path d="'+path+'"/></svg>';
-}
-function renderDetail(p){
-  // Lines: [0]=summary, [1]=probability/EV, [2..2+legCount-1]=one bullet per leg
-  // (same order as p.legs), then a trailing caveat line.
-  const lines=p.explanation.split("\n");
-  const legCount=p.legs.length;
-  return lines.map((line,idx)=>{
-    const legIdx=idx-2;
-    if(legIdx>=0 && legIdx<legCount && line.startsWith("• ")){
-      return '<div class="detail-line leg">'+sideArrow(p.legs[legIdx].side)+'<span>'+escapeHtml(line.slice(2))+'</span></div>';
-    }
-    return '<div class="detail-line">'+escapeHtml(line)+'</div>';
-  }).join("");
-}
 
 function renderParlays(parlays){
   resultsEl.innerHTML="";
@@ -993,22 +1096,23 @@ function renderParlays(parlays){
   }
   parlays.forEach((p,i)=>{
     const row=document.createElement("article");
-    const podium=i===0?" gold":i===1?" silver":i===2?" bronze":"";
-    row.className="parlay-row"+podium;
-    const legsHtml=p.legs.map(l=>'<li>'+sideArrow(l.side)+'<b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??''))+'</li>').join("");
+    row.className="parlay-row"+(i===0?" top":"");
+    const legsHtml=p.legs.map(l=>'<li><b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??''))+'</li>').join("");
     const evPct=(p.evPerDollar*100).toFixed(1);
     const evClass=p.evPerDollar>=-0.05?"pos":"neg";
+    const scoreClass=p.avgPickScore>=90?"pos":p.avgPickScore>=70?"":"neg";
     row.innerHTML=
       '<div class="rank">'+String(i+1).padStart(2,"0")+'</div>'+
       '<div class="parlay-body">'+
         '<h3>'+p.legs.length+'-leg parlay</h3>'+
         '<ul class="leg-list">'+legsHtml+'</ul>'+
         '<button class="toggle-detail">Show research</button>'+
-        '<div class="parlay-detail">'+renderDetail(p)+'</div>'+
+        '<div class="parlay-detail">'+escapeHtml(p.explanation)+'</div>'+
       '</div>'+
       '<div class="parlay-figures">'+
         '<div class="odds-figure">'+formatAmerican(p.combinedAmerican)+'</div>'+
         '<div class="ev-tag '+evClass+'">'+(evPct>=0?"+":"")+evPct+'% EV</div>'+
+        '<div class="ev-tag '+scoreClass+'">Pick Score '+p.avgPickScore+'</div>'+
       '</div>';
     row.querySelector(".toggle-detail").addEventListener("click",(e)=>{
       const detail=row.querySelector(".parlay-detail");
@@ -1024,9 +1128,10 @@ async function scan(){
   scanBtn.disabled=true;scanBtn.textContent="Scanning…";
   resultsEl.innerHTML='<p class="empty-state">Pulling live prop lines and building combos…</p>';
   const target=parseTargetOdds(targetOddsInput.value);
+  const minScore=Math.max(0,Math.min(100,parseInt(minScoreInput.value,10)||70));
   const sportsParam=[...activeSports].join(",");
   try{
-    const res=await fetch("/api/scan?sports="+sportsParam+"&target="+target);
+    const res=await fetch("/api/scan?sports="+sportsParam+"&target="+target+"&minPickScore="+minScore);
     const data=await res.json();
     if(data.error){
       resultsEl.innerHTML='<p class="empty-state">'+escapeHtml(data.error)+'</p>';
@@ -1047,14 +1152,8 @@ async function scan(){
   }
 }
 
-window.addEventListener('unhandledrejection',function(e){
-  document.body.insertAdjacentHTML('afterbegin','<div style="background:#c0392b;color:#fff;padding:14px;font-family:monospace;font-size:13px;white-space:pre-wrap;position:relative;z-index:999">PROMISE ERROR: '+(e.reason&&e.reason.stack?e.reason.stack:e.reason)+'</div>');
-});
-
 scanBtn.addEventListener("click",scan);
-loadSports().catch(err=>{
-  document.body.insertAdjacentHTML('afterbegin','<div style="background:#c0392b;color:#fff;padding:14px;font-family:monospace;font-size:13px;white-space:pre-wrap;position:relative;z-index:999">loadSports() FAILED: '+err.message+'</div>');
-});
+loadSports();
 </script>
 </body>
 </html>`;
@@ -1069,56 +1168,54 @@ const HISTORY_HTML = `<!doctype html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Track Record — Longshot Board</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23071310'/%3E%3Cpolyline points='6,20 12,14 16,17 26,7' fill='none' stroke='%233ddc84' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='26' cy='7' r='2.2' fill='%233ddc84'/%3E%3C/svg%3E" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1720'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='20' font-weight='700' fill='%23f0a84e' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
 <style>
 :root{
-  --ink:#071310; --ink-raised:#0f1f19; --hairline:#1f3a2c; --hairline-bright:#2f5a41;
-  --green:#3ddc84; --green-deep:#1f8f52;
-  --red:#e08579;
-  --text:#eaf3ea; --text-dim:#7ea08c;
+  --ink:#0d1720; --ink-raised:#15222c; --hairline:#24343f; --hairline-bright:#37505f;
+  --amber:#f0a84e; --amber-deep:#b97a2e;
+  --green:#7fcf9e; --red:#d97a6c;
+  --text:#f1ece0; --text-dim:#8fa1ab;
   --serif:"Fraunces",Georgia,serif; --sans:"IBM Plex Sans",system-ui,sans-serif; --mono:"IBM Plex Mono",monospace;
 }
 *{box-sizing:border-box}html{color-scheme:dark}
-body{margin:0;background:var(--ink);color:var(--text);font-family:var(--mono);line-height:1.5;-webkit-font-smoothing:antialiased}
-a{color:var(--green);font-size:.85rem}
-:focus-visible{outline:2px solid var(--green);outline-offset:2px}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:var(--amber);font-size:.85rem}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
 .board{max-width:900px;margin:0 auto;padding:40px 20px 90px}
 h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.6rem,4.4vw,2.1rem);margin:14px 0 20px}
-h2{font-family:var(--serif);font-size:1.02rem;font-weight:600;margin:34px 0 14px;color:var(--text)}
+h2{font-family:var(--serif);font-size:1.05rem;font-weight:600;margin:34px 0 14px;color:var(--text)}
 
+/* calibration strip: one continuous ticker row, not a grid of identical boxes */
 .calibration{display:flex;flex-wrap:wrap;gap:0;background:var(--ink-raised);border:1px solid var(--hairline);border-radius:10px;overflow:hidden}
 .calibration .cell{flex:1;min-width:140px;padding:16px 18px;border-right:1px solid var(--hairline)}
 .calibration .cell:last-child{border-right:none}
-.cell .num{font-weight:600;font-size:1.3rem;color:var(--green)}
-.cell .lbl{color:var(--text-dim);font-size:.72rem;margin-top:4px;font-family:var(--sans)}
-.empty-state{color:var(--text-dim);padding:22px 4px;font-family:var(--sans)}
+.cell .num{font-family:var(--mono);font-weight:600;font-size:1.35rem;color:var(--amber)}
+.cell .lbl{color:var(--text-dim);font-size:.75rem;margin-top:4px}
+.empty-state{color:var(--text-dim);padding:22px 4px}
 
 .pick-row{display:flex;gap:14px;padding:16px 4px 16px 14px;border-left:2px solid var(--hairline);border-bottom:1px solid var(--hairline)}
 .pick-row.win{border-left-color:var(--green)}
 .pick-row.loss{border-left-color:var(--red)}
-.pick-row.push{border-left-color:var(--green-deep)}
+.pick-row.push{border-left-color:var(--amber-deep)}
 .pick-body{flex:1;min-width:0}
-.pick-meta{display:flex;gap:12px;flex-wrap:wrap;color:var(--text-dim);font-size:.76rem;margin-bottom:8px}
-.leg-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-top:1px solid var(--hairline);font-size:.85rem;font-family:var(--sans)}
-.side-arrow{flex-shrink:0}
-.side-arrow.up path{fill:var(--green)}
-.side-arrow.down path{fill:var(--red)}
+.pick-meta{display:flex;gap:12px;flex-wrap:wrap;color:var(--text-dim);font-size:.78rem;font-family:var(--mono);margin-bottom:8px}
+.leg-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-top:1px solid var(--hairline);font-size:.87rem}
 .leg-row:first-of-type{border-top:none}
 .leg-btns{display:flex;gap:6px;flex-shrink:0}
-.leg-btns button{background:none;border:1px solid var(--hairline-bright);color:var(--text-dim);font-size:.7rem;padding:4px 10px;border-radius:99px;cursor:pointer;font-family:var(--sans)}
-.leg-btns button.active-win{border-color:var(--green);color:var(--green);background:rgba(61,220,132,.1)}
-.leg-btns button.active-loss{border-color:var(--red);color:var(--red);background:rgba(224,133,121,.1)}
-.leg-btns button.active-push{border-color:var(--green-deep);color:var(--green);background:rgba(31,143,82,.15)}
-.save-btn{margin-top:12px;background:var(--green);color:#07130d;border:none;font-weight:600;font-size:.8rem;padding:8px 16px;border-radius:7px;cursor:pointer;font-family:var(--sans)}
-.result-tag{font-size:.7rem;padding:2px 8px;border-radius:4px;flex-shrink:0;align-self:flex-start}
-.result-tag.win{color:var(--green);background:rgba(61,220,132,.1)}
-.result-tag.loss{color:var(--red);background:rgba(224,133,121,.1)}
-.result-tag.push{color:var(--green);background:rgba(31,143,82,.15)}
+.leg-btns button{background:none;border:1px solid var(--hairline-bright);color:var(--text-dim);font-size:.72rem;padding:4px 10px;border-radius:99px;cursor:pointer;font-family:var(--sans)}
+.leg-btns button.active-win{border-color:var(--green);color:var(--green);background:rgba(127,207,158,.1)}
+.leg-btns button.active-loss{border-color:var(--red);color:var(--red);background:rgba(217,122,108,.1)}
+.leg-btns button.active-push{border-color:var(--amber-deep);color:var(--amber);background:rgba(240,168,78,.1)}
+.save-btn{margin-top:12px;background:var(--amber);color:#17222a;border:none;font-weight:600;font-size:.82rem;padding:8px 16px;border-radius:7px;cursor:pointer;font-family:var(--sans)}
+.result-tag{font-family:var(--mono);font-size:.72rem;padding:2px 8px;border-radius:4px;flex-shrink:0;align-self:flex-start}
+.result-tag.win{color:var(--green);background:rgba(127,207,158,.1)}
+.result-tag.loss{color:var(--red);background:rgba(217,122,108,.1)}
+.result-tag.push{color:var(--amber);background:rgba(240,168,78,.1)}
 </style>
 </head>
 <body>
@@ -1135,11 +1232,6 @@ h2{font-family:var(--serif);font-size:1.02rem;font-weight:600;margin:34px 0 14px
 function fmtPct(x){return x==null?"—":(x*100).toFixed(1)+"%"}
 function fmtAmerican(n){return n>0?"+"+n:""+n}
 function escapeHtml(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
-function sideArrow(side){
-  const isUp=side!=="Under";
-  const path=isUp?"M6 1 L11 9 L1 9 Z":"M6 9 L1 1 L11 1 Z";
-  return '<svg class="side-arrow '+(isUp?"up":"down")+'" viewBox="0 0 12 10" width="9" height="8"><path d="'+path+'"/></svg>';
-}
 
 async function loadStats(){
   const s = await fetch("/api/track-record").then(r=>r.json());
@@ -1163,7 +1255,7 @@ async function loadUngraded(){
     const row = document.createElement("div");
     row.className = "pick-row";
     const legsHtml = pick.legs.map(l =>
-      '<div class="leg-row"><span style="display:flex;align-items:center;gap:6px">'+sideArrow(l.side)+escapeHtml(l.player+" "+l.side+" "+(l.point??"")+" — "+l.matchup)+'</span>'+
+      '<div class="leg-row"><span>'+escapeHtml(l.player+" "+l.side+" "+(l.point??"")+" — "+l.matchup)+'</span>'+
       '<span class="leg-btns" data-leg="'+l.id+'">'+
         '<button data-call="win">Win</button><button data-call="loss">Loss</button><button data-call="push">Push</button>'+
       '</span></div>'
