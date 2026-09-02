@@ -938,6 +938,9 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.08rem;margin:0 0 10px;co
 </div>
 
 <script>
+window.onerror=function(msg,url,line,col,error){
+  document.body.insertAdjacentHTML('afterbegin','<div style="background:#c0392b;color:#fff;padding:14px;font-family:monospace;font-size:13px;white-space:pre-wrap;position:relative;z-index:999">JS ERROR: '+msg+'\\nline '+line+' col '+col+'\\n'+(error&&error.stack?error.stack:'')+'</div>');
+};
 const sportTogglesEl=document.getElementById("sport-toggles"),resultsEl=document.getElementById("results"),scanBtn=document.getElementById("scan-btn"),scanMetaEl=document.getElementById("scan-meta"),tickerEl=document.getElementById("ticker-line"),targetOddsInput=document.getElementById("target-odds");
 let activeSports=new Set();
 
@@ -1042,8 +1045,14 @@ async function scan(){
   }
 }
 
+window.addEventListener('unhandledrejection',function(e){
+  document.body.insertAdjacentHTML('afterbegin','<div style="background:#c0392b;color:#fff;padding:14px;font-family:monospace;font-size:13px;white-space:pre-wrap;position:relative;z-index:999">PROMISE ERROR: '+(e.reason&&e.reason.stack?e.reason.stack:e.reason)+'</div>');
+});
+
 scanBtn.addEventListener("click",scan);
-loadSports();
+loadSports().catch(err=>{
+  document.body.insertAdjacentHTML('afterbegin','<div style="background:#c0392b;color:#fff;padding:14px;font-family:monospace;font-size:13px;white-space:pre-wrap;position:relative;z-index:999">loadSports() FAILED: '+err.message+'</div>');
+});
 </script>
 </body>
 </html>`;
