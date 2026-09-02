@@ -1,4 +1,5 @@
 import express from "express";
+import fs from "fs";
 
 /* ────────────────────────────────────────────────────────────────────────
    ODDS MATH
@@ -195,6 +196,84 @@ function normalizeEventOdds(eventData, sportKey, sportLabel) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────
+   LINE MOVEMENT TRACKING
+   Persists each leg's opening price/probability to disk (Railway volume at
+   /data) and compares it against the current scan on every subsequent scan.
+   A line moving without an obvious news reason is often sharp money — a
+   signal this app otherwise wouldn't see from a single snapshot.
+   This is a heuristic nudge, not a validated predictive signal: it's
+   surfaced in the research text and given a modest ranking boost, but it
+   never overrides the de-vigged probability math.
+──────────────────────────────────────────────────────────────────────── */
+
+const HISTORY_PATH = process.env.LINE_HISTORY_PATH || "/data/line-history.json";
+const MEANINGFUL_PROB_MOVE = 0.03; // 3 probability points — below this we call it noise
+
+let historyWriteWarned = false;
+
+function loadLineHistory() {
+  try {
+    return JSON.parse(fs.readFileSync(HISTORY_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveLineHistory(history) {
+  try {
+    fs.writeFileSync(HISTORY_PATH, JSON.stringify(history));
+  } catch (err) {
+    if (!historyWriteWarned) {
+      console.warn(`Line history not persisted (${err.message}) — movement tracking disabled until this is fixed.`);
+      historyWriteWarned = true;
+    }
+  }
+}
+
+/**
+ * Mutates each leg with a `movement` field (null on first sighting) and
+ * persists updated opening/latest prices to disk. Stale entries (games
+ * that have already started) are pruned so the file doesn't grow forever.
+ */
+function applyLineMovement(legs) {
+  const now = Date.now();
+  const history = loadLineHistory();
+
+  for (const key of Object.keys(history)) {
+    const commence = Date.parse(history[key].commenceTime);
+    if (!Number.isNaN(commence) && commence < now) delete history[key];
+  }
+
+  for (const leg of legs) {
+    const existing = history[leg.id];
+    if (!existing) {
+      history[leg.id] = {
+        commenceTime: leg.commenceTime,
+        openingAmerican: leg.bestAmerican,
+        openingTrueProb: leg.trueProb,
+        firstSeen: new Date(now).toISOString(),
+        scans: 1,
+      };
+      leg.movement = null;
+    } else {
+      existing.scans += 1;
+      const deltaProb = leg.trueProb - existing.openingTrueProb;
+      leg.movement = {
+        openingAmerican: existing.openingAmerican,
+        openingTrueProb: existing.openingTrueProb,
+        deltaAmerican: leg.bestAmerican - existing.openingAmerican,
+        deltaProb,
+        scans: existing.scans,
+        significant: Math.abs(deltaProb) >= MEANINGFUL_PROB_MOVE,
+      };
+    }
+  }
+
+  saveLineHistory(history);
+  return legs;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
    PARLAY BUILDER
 ──────────────────────────────────────────────────────────────────────── */
 
@@ -210,8 +289,14 @@ function combinedAmerican(legs) {
   return { decimal, american: decimalToAmerican(decimal) };
 }
 
+function movementBoost(leg) {
+  if (!leg.movement || !leg.movement.significant || leg.movement.deltaProb <= 0) return 1;
+  // Modest, capped boost — this is a heuristic nudge, not a validated edge.
+  return 1 + Math.min(leg.movement.deltaProb * 4, 0.4);
+}
+
 function pickWeightedByEdge(pool, rng) {
-  const weights = pool.map((l) => Math.max(l.edge, 0) * 20 + 1);
+  const weights = pool.map((l) => (Math.max(l.edge, 0) * 20 + 1) * movementBoost(l));
   const total = weights.reduce((a, b) => a + b, 0);
   let r = rng() * total;
   for (let i = 0; i < pool.length; i++) {
@@ -289,12 +374,22 @@ function explainParlay(parlay) {
   );
   for (const leg of parlay.legs) {
     const edgePct = (leg.edge * 100).toFixed(1);
+    let movementText;
+    if (!leg.movement) {
+      movementText = " First scan tracking this line — no movement history yet.";
+    } else if (leg.movement.significant) {
+      const pts = (Math.abs(leg.movement.deltaProb) * 100).toFixed(1);
+      const dir = leg.movement.deltaProb > 0 ? "toward" : "away from";
+      movementText = ` Line has moved ${dir} this side by ${pts} probability points since it opened at ${leg.movement.openingAmerican > 0 ? "+" : ""}${leg.movement.openingAmerican} (${leg.movement.scans} scans tracked) — possible sharp money.`;
+    } else {
+      movementText = ` Line steady since it opened at ${leg.movement.openingAmerican > 0 ? "+" : ""}${leg.movement.openingAmerican} (${leg.movement.scans} scans tracked, no meaningful movement).`;
+    }
     lines.push(
       `• ${leg.player} ${leg.side} ${leg.point ?? ""} ${marketLabel(leg.market)} (${leg.matchup}) — best price ${leg.bestAmerican > 0 ? "+" : ""}${leg.bestAmerican} at ${leg.bestBook}, ${leg.numBooks} books quoting it${
         leg.devigged
           ? `, de-vigged true probability ${(leg.trueProb * 100).toFixed(1)}% (${edgePct}% ${leg.edge >= 0 ? "better" : "worse"} than the market's own implied price)`
           : " (single-sided market — probability is vig-inclusive, not de-vigged)"
-      }.`
+      }.${movementText}`
     );
   }
   lines.push(
@@ -362,6 +457,7 @@ app.get("/api/scan", async (req, res) => {
 
   try {
     const { allLegs, scanned } = await scanSports(requestedSports);
+    applyLineMovement(allLegs);
     if (!allLegs.length) {
       const authError = scanned.errors.find((e) => e.status === 401);
       return res.status(200).json({
