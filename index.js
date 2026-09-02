@@ -818,9 +818,12 @@ async function scanSports(sportKeys, windowHours) {
 
   let from, to;
   if (windowHours) {
+    // The Odds API requires exactly YYYY-MM-DDTHH:MM:SSZ — no milliseconds,
+    // which toISOString() includes by default (e.g. ...16:05:00.123Z).
+    const stripMs = (d) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
     const now = new Date();
-    from = now.toISOString();
-    to = new Date(now.getTime() + windowHours * 3600_000).toISOString();
+    from = stripMs(now);
+    to = stripMs(new Date(now.getTime() + windowHours * 3600_000));
   }
 
   for (const sportKey of sportKeys) {
