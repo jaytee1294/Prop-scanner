@@ -870,8 +870,6 @@ app.get("/api/scan", async (req, res) => {
   const requestedSports = (req.query.sports ? req.query.sports.split(",") : Object.keys(SPORTS)).filter((s) => SPORTS[s]);
   const targetOdds = Number(req.query.target) || 1000;
   const forceRefresh = req.query.refresh === "true";
-  // Default 36h window ("today-ish", accounting for late games and time zones)
-  // rather than pulling everything the odds API has scheduled out for weeks.
   const windowParam = req.query.window;
   const windowHours = windowParam === "all" ? undefined : windowParam != null ? Number(windowParam) : 36;
 
@@ -1060,22 +1058,12 @@ h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.7rem,4.6vw,2.35rem
 .parlay-body{flex:1;min-width:0}
 .parlay-row.top h3{font-size:1.35rem}
 h3{font-family:var(--serif);font-weight:600;font-size:1.1rem;margin:0 0 10px;color:var(--text)}
-.leg-list{list-style:none;margin:0 0 10px;padding:0;display:flex;flex-direction:column;gap:5px}
-.leg-list li{font-size:.85rem;color:var(--text-dim);display:flex;align-items:center;gap:6px}
+.leg-list{list-style:none;margin:0 0 10px;padding:0;display:flex;flex-direction:column;gap:3px}
+.leg-list li{font-size:.85rem;color:var(--text-dim)}
 .leg-list li b{color:var(--text);font-weight:500}
-.side-arrow{flex-shrink:0}
-.side-arrow.up path{fill:var(--green)}
-.side-arrow.down path{fill:var(--red)}
 .toggle-detail{background:none;border:none;color:var(--amber);font-size:.8rem;cursor:pointer;padding:0;font-family:var(--sans);font-weight:500}
-.parlay-detail{display:none;margin-top:12px;padding:16px 18px;background:var(--ink-raised);border-radius:8px;border:1px solid var(--hairline);font-size:.84rem;color:var(--text-dim)}
+.parlay-detail{display:none;margin-top:12px;padding:14px 16px;background:var(--ink-raised);border-radius:8px;border:1px solid var(--hairline);white-space:pre-line;font-size:.84rem;color:var(--text-dim)}
 .parlay-detail.open{display:block}
-.detail-summary{color:var(--text);font-size:.86rem;margin-bottom:6px;line-height:1.5}
-.detail-summary.sub{color:var(--text-dim);font-size:.8rem;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--hairline)}
-.detail-leg{display:flex;gap:10px;padding:10px 0;border-top:1px solid var(--hairline)}
-.detail-leg:first-of-type{border-top:none;padding-top:0}
-.detail-leg .side-arrow{margin-top:4px;flex-shrink:0}
-.detail-leg .leg-text{line-height:1.55}
-.detail-caveat{margin-top:14px;padding-top:14px;border-top:1px solid var(--hairline);font-size:.76rem;color:var(--text-dim);opacity:.8;line-height:1.5}
 .parlay-figures{text-align:right;flex-shrink:0;padding-top:2px}
 .odds-figure{font-family:var(--mono);font-weight:600;font-size:1.3rem;color:var(--amber)}
 .parlay-row.top .odds-figure{font-size:1.7rem}
@@ -1137,31 +1125,6 @@ async function loadSports(){
 function parseTargetOdds(raw){const n=parseInt(raw.replace(/[^0-9-]/g,""),10);return Number.isFinite(n)?Math.abs(n):1000}
 function formatAmerican(n){return n>0?"+"+n:""+n}
 function escapeHtml(str){const div=document.createElement("div");div.textContent=str;return div.innerHTML}
-function sideArrow(side){
-  const isUp=side!=="Under"; // Over and Yes both read as "betting toward it happening" -> up
-  const path=isUp?"M6 1 L11 9 L1 9 Z":"M6 9 L1 1 L11 1 Z";
-  return '<svg class="side-arrow '+(isUp?"up":"down")+'" viewBox="0 0 12 10" width="9" height="8"><path d="'+path+'"/></svg>';
-}
-function renderDetail(p){
-  // explainParlay's line order: [0]=summary, [1]=probability/EV, [2..2+legCount-1]=one
-  // bullet per leg in the same order as p.legs, then a trailing caveat line.
-  const lines=p.explanation.split("\n");
-  const legCount=p.legs.length;
-  let html="";
-  lines.forEach((line,idx)=>{
-    const legIdx=idx-2;
-    if(idx===0){
-      html+='<div class="detail-summary">'+escapeHtml(line)+'</div>';
-    } else if(idx===1){
-      html+='<div class="detail-summary sub">'+escapeHtml(line)+'</div>';
-    } else if(legIdx>=0 && legIdx<legCount && line.startsWith("• ")){
-      html+='<div class="detail-leg">'+sideArrow(p.legs[legIdx].side)+'<span class="leg-text">'+escapeHtml(line.slice(2))+'</span></div>';
-    } else {
-      html+='<div class="detail-caveat">'+escapeHtml(line)+'</div>';
-    }
-  });
-  return html;
-}
 
 function renderParlays(parlays){
   resultsEl.innerHTML="";
@@ -1172,7 +1135,7 @@ function renderParlays(parlays){
   parlays.forEach((p,i)=>{
     const row=document.createElement("article");
     row.className="parlay-row"+(i===0?" top":"");
-    const legsHtml=p.legs.map(l=>'<li>'+sideArrow(l.side)+'<b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??''))+'</li>').join("");
+    const legsHtml=p.legs.map(l=>'<li><b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??''))+'</li>').join("");
     const evPct=(p.evPerDollar*100).toFixed(1);
     const evClass=p.evPerDollar>=-0.05?"pos":"neg";
     const scoreClass=p.avgPickScore>=90?"pos":p.avgPickScore>=70?"":"neg";
@@ -1182,7 +1145,7 @@ function renderParlays(parlays){
         '<h3>'+p.legs.length+'-leg parlay</h3>'+
         '<ul class="leg-list">'+legsHtml+'</ul>'+
         '<button class="toggle-detail">Show research</button>'+
-        '<div class="parlay-detail">'+renderDetail(p)+'</div>'+
+        '<div class="parlay-detail">'+escapeHtml(p.explanation)+'</div>'+
       '</div>'+
       '<div class="parlay-figures">'+
         '<div class="odds-figure">'+formatAmerican(p.combinedAmerican)+'</div>'+
