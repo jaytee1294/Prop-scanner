@@ -1061,8 +1061,11 @@ h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.7rem,4.6vw,2.35rem
 .parlay-body{flex:1;min-width:0}
 .parlay-row.top h3{font-size:1.35rem}
 h3{font-family:var(--serif);font-weight:600;font-size:1.1rem;margin:0 0 10px;color:var(--text)}
-.leg-list{list-style:none;margin:0 0 10px;padding:0;display:flex;flex-direction:column;gap:3px}
-.leg-list li{font-size:.85rem;color:var(--text-dim)}
+.leg-list{list-style:none;margin:0 0 10px;padding:0;display:flex;flex-direction:column;gap:5px}
+.leg-list li{font-size:.85rem;color:var(--text-dim);display:flex;align-items:center;gap:6px}
+.side-arrow{flex-shrink:0}
+.side-arrow.up path{fill:var(--green)}
+.side-arrow.down path{fill:var(--red)}
 .leg-list li b{color:var(--text);font-weight:500}
 .toggle-detail{background:none;border:none;color:var(--amber);font-size:.8rem;cursor:pointer;padding:0;font-family:var(--sans);font-weight:500}
 .parlay-detail{display:none;margin-top:12px;padding:14px 16px;background:var(--ink-raised);border-radius:8px;border:1px solid var(--hairline);white-space:pre-line;font-size:.84rem;color:var(--text-dim)}
@@ -1128,6 +1131,14 @@ async function loadSports(){
 function parseTargetOdds(raw){const n=parseInt(raw.replace(/[^0-9-]/g,""),10);return Number.isFinite(n)?Math.abs(n):1000}
 function formatAmerican(n){return n>0?"+"+n:""+n}
 function escapeHtml(str){const div=document.createElement("div");div.textContent=str;return div.innerHTML}
+function sideArrow(side){
+  const isUp=side!=="Under"; // Over and Yes both read as "betting toward it happening" -> up
+  const path=isUp?"M6 1 L11 9 L1 9 Z":"M6 9 L1 1 L11 1 Z";
+  return '<svg class="side-arrow '+(isUp?"up":"down")+'" viewBox="0 0 12 10" width="9" height="8"><path d="'+path+'"/></svg>';
+}
+function marketLabel(marketKey){
+  return marketKey.replace(/^player_|^batter_|^pitcher_/,"").replace(/_/g," ");
+}
 
 function renderParlays(parlays){
   resultsEl.innerHTML="";
@@ -1138,7 +1149,7 @@ function renderParlays(parlays){
   parlays.forEach((p,i)=>{
     const row=document.createElement("article");
     row.className="parlay-row"+(i===0?" top":"");
-    const legsHtml=p.legs.map(l=>'<li><b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??''))+'</li>').join("");
+    const legsHtml=p.legs.map(l=>'<li>'+sideArrow(l.side)+'<b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??'')+' '+marketLabel(l.market))+'</li>').join("");
     const evPct=(p.evPerDollar*100).toFixed(1);
     const evClass=p.evPerDollar>=-0.05?"pos":"neg";
     const scoreClass=p.avgPickScore>=90?"pos":p.avgPickScore>=70?"":"neg";
