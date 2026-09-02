@@ -1,0 +1,484 @@
+import express from "express";
+
+/* ────────────────────────────────────────────────────────────────────────
+   ODDS MATH
+──────────────────────────────────────────────────────────────────────── */
+
+function americanToDecimal(american) {
+  if (american > 0) return 1 + american / 100;
+  return 1 + 100 / Math.abs(american);
+}
+function decimalToAmerican(decimal) {
+  if (decimal >= 2) return Math.round((decimal - 1) * 100);
+  return Math.round(-100 / (decimal - 1));
+}
+function americanToImpliedProb(american) {
+  if (american > 0) return 100 / (american + 100);
+  return Math.abs(american) / (Math.abs(american) + 100);
+}
+function devigTwoWay(americanA, americanB) {
+  const pA = americanToImpliedProb(americanA);
+  const pB = americanToImpliedProb(americanB);
+  const overround = pA + pB;
+  return { trueProbA: pA / overround, trueProbB: pB / overround, overround };
+}
+function combineDecimalOdds(arr) {
+  return arr.reduce((a, d) => a * d, 1);
+}
+function combineProbabilities(arr) {
+  return arr.reduce((a, p) => a * p, 1);
+}
+function expectedValuePerDollar(trueProb, decimalOdds) {
+  return trueProb * (decimalOdds - 1) + (1 - trueProb) * -1;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   SPORTS / MARKET CONFIG
+   Coverage drifts as books add/drop markets — verify against
+   https://the-odds-api.com/sports-odds-data/betting-markets.html if a
+   sport comes back empty.
+──────────────────────────────────────────────────────────────────────── */
+
+const SPORTS = {
+  americanfootball_nfl: {
+    label: "NFL",
+    markets: [
+      "player_pass_tds", "player_pass_yds", "player_pass_completions",
+      "player_pass_interceptions", "player_rush_yds", "player_reception_yds",
+      "player_receptions", "player_anytime_td",
+    ],
+  },
+  basketball_nba: {
+    label: "NBA",
+    markets: [
+      "player_points", "player_rebounds", "player_assists", "player_threes",
+      "player_blocks", "player_steals", "player_points_rebounds_assists",
+    ],
+  },
+  baseball_mlb: {
+    label: "MLB",
+    markets: [
+      "batter_home_runs", "batter_hits", "batter_total_bases",
+      "batter_rbis", "batter_stolen_bases", "pitcher_strikeouts",
+    ],
+  },
+  icehockey_nhl: {
+    label: "NHL",
+    markets: ["player_points", "player_goals", "player_assists", "player_shots_on_goal"],
+  },
+  basketball_wnba: {
+    label: "WNBA",
+    markets: ["player_points", "player_rebounds", "player_assists", "player_threes"],
+  },
+};
+
+const DEFAULT_REGIONS = process.env.ODDS_API_REGIONS || "us";
+const MAX_EVENTS_PER_SPORT = 6;
+
+/* ────────────────────────────────────────────────────────────────────────
+   ODDS API CLIENT
+──────────────────────────────────────────────────────────────────────── */
+
+const BASE_URL = "https://api.the-odds-api.com/v4";
+
+class OddsApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "OddsApiError";
+    this.status = status;
+  }
+}
+
+function requireKey() {
+  const key = process.env.ODDS_API_KEY;
+  if (!key || key === "your_key_here") {
+    throw new OddsApiError(
+      "ODDS_API_KEY is not set. Add it as an environment variable.",
+      401
+    );
+  }
+  return key;
+}
+
+async function getJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new OddsApiError(`Odds API request failed (${res.status}): ${body}`, res.status);
+  }
+  return res.json();
+}
+
+async function listEvents(sportKey) {
+  const key = requireKey();
+  const params = new URLSearchParams({ apiKey: key });
+  return getJson(`${BASE_URL}/sports/${sportKey}/events?${params.toString()}`);
+}
+
+async function getEventPlayerProps(sportKey, eventId, markets, regions) {
+  const key = requireKey();
+  const params = new URLSearchParams({
+    apiKey: key,
+    regions,
+    markets: markets.join(","),
+    oddsFormat: "american",
+    dateFormat: "iso",
+  });
+  return getJson(`${BASE_URL}/sports/${sportKey}/events/${eventId}/odds?${params.toString()}`);
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   NORMALIZE ODDS -> DE-VIGGED LEGS
+──────────────────────────────────────────────────────────────────────── */
+
+const ONE_SIDED_MARKETS = new Set(["player_anytime_td", "player_1st_td", "player_last_td"]);
+
+function legKey(market, player, point) {
+  return `${market}::${player}::${point}`;
+}
+
+function normalizeEventOdds(eventData, sportKey, sportLabel) {
+  const { id: eventId, commence_time, home_team, away_team, bookmakers = [] } = eventData;
+  const grouped = new Map();
+
+  for (const book of bookmakers) {
+    for (const market of book.markets || []) {
+      for (const outcome of market.outcomes || []) {
+        const player = outcome.description || outcome.name;
+        const side = ["Over", "Under"].includes(outcome.name) ? outcome.name : "Yes";
+        const key = legKey(market.key, player, outcome.point ?? "NA");
+        if (!grouped.has(key)) {
+          grouped.set(key, { market: market.key, player, point: outcome.point ?? null, sides: {} });
+        }
+        const entry = grouped.get(key);
+        if (!entry.sides[side]) entry.sides[side] = [];
+        entry.sides[side].push({ book: book.title, american: outcome.price });
+      }
+    }
+  }
+
+  const legs = [];
+
+  for (const { market, player, point, sides } of grouped.values()) {
+    const oneSided = ONE_SIDED_MARKETS.has(market);
+    for (const side of Object.keys(sides)) {
+      const quotes = sides[side];
+      const opposite = side === "Over" ? sides["Under"] : side === "Under" ? sides["Over"] : null;
+      const best = quotes.reduce((a, b) => (a.american > b.american ? a : b));
+
+      let trueProb;
+      let devigged = false;
+      if (!oneSided && opposite && opposite.length) {
+        const pairedTrueProbs = quotes.map((q) => {
+          const oppForBook = opposite.find((o) => o.book === q.book) || opposite[0];
+          return devigTwoWay(q.american, oppForBook.american).trueProbA;
+        });
+        trueProb = pairedTrueProbs.reduce((a, b) => a + b, 0) / pairedTrueProbs.length;
+        devigged = true;
+      } else {
+        trueProb = americanToImpliedProb(best.american);
+      }
+
+      legs.push({
+        id: `${eventId}:${market}:${player}:${side}:${point}`,
+        sport: sportKey, sportLabel, eventId, commenceTime: commence_time,
+        matchup: `${away_team} @ ${home_team}`,
+        market, player, side, point,
+        bestAmerican: best.american, bestBook: best.book, numBooks: quotes.length,
+        impliedProbBest: americanToImpliedProb(best.american),
+        trueProb, devigged,
+        edge: trueProb - americanToImpliedProb(best.american),
+      });
+    }
+  }
+  return legs;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   PARLAY BUILDER
+──────────────────────────────────────────────────────────────────────── */
+
+const DEFAULT_OPTIONS = {
+  targetAmericanOdds: 1000, toleranceLow: 700, toleranceHigh: 1600,
+  minLegs: 3, maxLegs: 6, minBooksPerLeg: 2,
+  minTrueProb: 0.12, maxTrueProb: 0.72,
+  allowSameEventLegs: false, iterations: 8000, resultCount: 10,
+};
+
+function combinedAmerican(legs) {
+  const decimal = combineDecimalOdds(legs.map((l) => americanToDecimal(l.bestAmerican)));
+  return { decimal, american: decimalToAmerican(decimal) };
+}
+
+function pickWeightedByEdge(pool, rng) {
+  const weights = pool.map((l) => Math.max(l.edge, 0) * 20 + 1);
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = rng() * total;
+  for (let i = 0; i < pool.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return pool[i];
+  }
+  return pool[pool.length - 1];
+}
+
+function buildParlays(allLegs, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  const rng = Math.random;
+  const pool = allLegs.filter(
+    (l) => l.numBooks >= opts.minBooksPerLeg && l.trueProb >= opts.minTrueProb && l.trueProb <= opts.maxTrueProb
+  );
+
+  const seen = new Set();
+  const results = [];
+
+  for (let i = 0; i < opts.iterations && pool.length >= opts.minLegs; i++) {
+    const legCount = opts.minLegs + Math.floor(rng() * (opts.maxLegs - opts.minLegs + 1));
+    const combo = [];
+    const usedEvents = new Set();
+    let attempts = 0;
+
+    while (combo.length < legCount && attempts < legCount * 15) {
+      attempts++;
+      const candidate = pickWeightedByEdge(pool, rng);
+      if (combo.some((l) => l.id === candidate.id)) continue;
+      if (!opts.allowSameEventLegs && usedEvents.has(candidate.eventId)) continue;
+      combo.push(candidate);
+      usedEvents.add(candidate.eventId);
+    }
+    if (combo.length < opts.minLegs) continue;
+
+    const { american } = combinedAmerican(combo);
+    if (american < opts.toleranceLow || american > opts.toleranceHigh) continue;
+
+    const key = combo.map((l) => l.id).sort().join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const trueProb = combineProbabilities(combo.map((l) => l.trueProb));
+    const decimal = combineDecimalOdds(combo.map((l) => americanToDecimal(l.bestAmerican)));
+    const ev = expectedValuePerDollar(trueProb, decimal);
+
+    results.push({
+      legs: combo.sort((a, b) => b.edge - a.edge),
+      combinedAmerican: american, combinedDecimal: decimal,
+      trueProbability: trueProb, evPerDollar: ev,
+      avgBooksPerLeg: combo.reduce((a, l) => a + l.numBooks, 0) / combo.length,
+      allDevigged: combo.every((l) => l.devigged),
+    });
+  }
+
+  results.sort((a, b) => {
+    if (Math.abs(a.evPerDollar - b.evPerDollar) > 0.005) return b.evPerDollar - a.evPerDollar;
+    return Math.abs(a.combinedAmerican - opts.targetAmericanOdds) - Math.abs(b.combinedAmerican - opts.targetAmericanOdds);
+  });
+
+  return results.slice(0, opts.resultCount);
+}
+
+function marketLabel(marketKey) {
+  return marketKey.replace(/^player_|^batter_|^pitcher_/, "").replace(/_/g, " ");
+}
+
+function explainParlay(parlay) {
+  const lines = [];
+  lines.push(
+    `${parlay.legs.length}-leg parlay at +${parlay.combinedAmerican} (fair-ish odds ${(1 / parlay.trueProbability).toFixed(1)}:1 based on de-vigged leg probabilities).`
+  );
+  lines.push(
+    `Estimated true hit probability: ${(parlay.trueProbability * 100).toFixed(1)}%. Modeled EV: ${parlay.evPerDollar >= 0 ? "+" : ""}${(parlay.evPerDollar * 100).toFixed(1)}% per $1 staked — ${parlay.evPerDollar >= -0.05 ? "close to fair for a longshot parlay" : "still carries the standard sportsbook hold; treat as entertainment-weighted, not a value bet"}.`
+  );
+  for (const leg of parlay.legs) {
+    const edgePct = (leg.edge * 100).toFixed(1);
+    lines.push(
+      `• ${leg.player} ${leg.side} ${leg.point ?? ""} ${marketLabel(leg.market)} (${leg.matchup}) — best price ${leg.bestAmerican > 0 ? "+" : ""}${leg.bestAmerican} at ${leg.bestBook}, ${leg.numBooks} books quoting it${
+        leg.devigged
+          ? `, de-vigged true probability ${(leg.trueProb * 100).toFixed(1)}% (${edgePct}% ${leg.edge >= 0 ? "better" : "worse"} than the market's own implied price)`
+          : " (single-sided market — probability is vig-inclusive, not de-vigged)"
+      }.`
+    );
+  }
+  lines.push(
+    "Caveat: EV assumes legs are independent. Legs are kept to one per game specifically to avoid correlation this model can't measure — treat same-game stacks with extra skepticism if you build them manually."
+  );
+  return lines.join("\n");
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+   SERVER
+──────────────────────────────────────────────────────────────────────── */
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const CACHE_TTL_MS = 10 * 60 * 1000;
+let cache = { key: null, timestamp: 0, data: null };
+
+async function scanSports(sportKeys) {
+  const allLegs = [];
+  const scanned = { events: 0, sportsWithData: [], errors: [] };
+
+  for (const sportKey of sportKeys) {
+    const config = SPORTS[sportKey];
+    if (!config) continue;
+
+    let events;
+    try {
+      events = await listEvents(sportKey);
+    } catch (err) {
+      scanned.errors.push({ sport: sportKey, stage: "listEvents", message: err.message, status: err.status });
+      continue;
+    }
+    if (!events || !events.length) continue;
+
+    const eventsToPull = events.slice(0, MAX_EVENTS_PER_SPORT);
+    let sportHadLegs = false;
+
+    for (const event of eventsToPull) {
+      try {
+        const oddsData = await getEventPlayerProps(sportKey, event.id, config.markets, DEFAULT_REGIONS);
+        const legs = normalizeEventOdds(oddsData, sportKey, config.label);
+        if (legs.length) sportHadLegs = true;
+        allLegs.push(...legs);
+        scanned.events++;
+      } catch (err) {
+        scanned.errors.push({ sport: sportKey, eventId: event.id, stage: "getEventPlayerProps", message: err.message });
+      }
+    }
+    if (sportHadLegs) scanned.sportsWithData.push(config.label);
+  }
+  return { allLegs, scanned };
+}
+
+app.use(express.json());
+
+app.get("/api/scan", async (req, res) => {
+  const requestedSports = (req.query.sports ? req.query.sports.split(",") : Object.keys(SPORTS)).filter((s) => SPORTS[s]);
+  const targetOdds = Number(req.query.target) || 1000;
+  const forceRefresh = req.query.refresh === "true";
+  const cacheKey = `${requestedSports.sort().join(",")}::${targetOdds}`;
+  const isFresh = cache.key === cacheKey && Date.now() - cache.timestamp < CACHE_TTL_MS;
+
+  if (isFresh && !forceRefresh) return res.json({ ...cache.data, cached: true });
+
+  try {
+    const { allLegs, scanned } = await scanSports(requestedSports);
+    if (!allLegs.length) {
+      const authError = scanned.errors.find((e) => e.status === 401);
+      return res.status(200).json({
+        parlays: [], scanned,
+        message: authError
+          ? "No ODDS_API_KEY configured — set it as an environment variable."
+          : "No player-prop legs came back for the requested sports right now (off-slate day, or books haven't posted props yet).",
+      });
+    }
+    const parlays = buildParlays(allLegs, { targetAmericanOdds: targetOdds });
+    const withExplanations = parlays.map((p) => ({ ...p, explanation: explainParlay(p) }));
+    const payload = { parlays: withExplanations, scanned: { ...scanned, legsFound: allLegs.length }, generatedAt: new Date().toISOString() };
+    cache = { key: cacheKey, timestamp: Date.now(), data: payload };
+    res.json({ ...payload, cached: false });
+  } catch (err) {
+    const status = err instanceof OddsApiError ? err.status : 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+app.get("/api/sports", (req, res) => {
+  res.json(Object.entries(SPORTS).map(([key, v]) => ({ key, label: v.label })));
+});
+
+app.get("/", (req, res) => {
+  res.type("html").send(DASHBOARD_HTML);
+});
+
+const DASHBOARD_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Longshot Board — Prop Parlay Scanner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+:root{--ink:#0f1b22;--panel:#16262f;--hairline:#2c414c;--amber:#e8a33d;--amber-dim:#a97a33;--green:#6fbf8b;--red:#c96a5c;--text:#ede9df;--text-muted:#8fa3ac;--serif:"Fraunces",Georgia,serif;--sans:"IBM Plex Sans",system-ui,sans-serif}
+*{box-sizing:border-box}html{color-scheme:dark}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--sans);line-height:1.5}
+.board{max-width:880px;margin:0 auto;padding:48px 24px 80px}
+.board-head{display:flex;justify-content:space-between;align-items:flex-end;gap:32px;border-bottom:1px solid var(--hairline);padding-bottom:28px}
+.eyebrow{color:var(--amber);font-size:.85rem;margin:0 0 10px}
+h1{font-family:var(--serif);font-weight:600;font-size:clamp(2.2rem,5vw,3.2rem);margin:0 0 14px;letter-spacing:-.01em}
+.sub{color:var(--text-muted);max-width:52ch;margin:0;font-size:.98rem}
+.board-head-stat{display:flex;flex-direction:column;align-items:flex-end;flex-shrink:0}
+.stat-number{font-family:var(--serif);font-size:3rem;font-variant-numeric:tabular-nums;color:var(--amber);line-height:1}
+.stat-label{color:var(--text-muted);font-size:.8rem;margin-top:6px}
+.controls{display:flex;flex-wrap:wrap;align-items:center;gap:18px;padding:24px 0;border-bottom:1px solid var(--hairline)}
+.control-group{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.sport-chip{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px solid var(--hairline);border-radius:4px;font-size:.85rem;cursor:pointer;color:var(--text-muted);user-select:none}
+.sport-chip.active{border-color:var(--amber-dim);color:var(--text);background:rgba(232,163,61,.08)}
+.control-target label{font-size:.85rem;color:var(--text-muted)}
+#target-odds{background:var(--panel);border:1px solid var(--hairline);color:var(--amber);font-family:var(--sans);font-variant-numeric:tabular-nums;font-size:.9rem;padding:7px 10px;border-radius:4px;width:90px}
+.scan-btn{background:var(--amber);color:#17222a;border:none;font-family:var(--sans);font-weight:600;font-size:.9rem;padding:10px 20px;border-radius:4px;cursor:pointer;margin-left:auto}
+.scan-btn:disabled{opacity:.6;cursor:progress}
+.scan-meta{color:var(--text-muted);font-size:.78rem}
+.results{padding-top:8px}
+.empty-state{color:var(--text-muted);padding:60px 0;text-align:center}
+.parlay-row{display:grid;grid-template-columns:56px 1fr auto;gap:20px;align-items:start;padding:22px 0;border-bottom:1px solid var(--hairline)}
+.rank{font-family:var(--serif);font-size:2.1rem;color:var(--amber-dim);line-height:1}
+.parlay-main h3{margin:0 0 4px;font-family:var(--serif);font-size:1.2rem;font-weight:600}
+.parlay-legs-preview{color:var(--text-muted);font-size:.88rem;margin:0 0 10px}
+.parlay-detail{display:none;margin-top:10px;padding:14px 16px;background:var(--panel);border-radius:4px;border:1px solid var(--hairline);white-space:pre-line;font-size:.86rem;color:var(--text-muted)}
+.parlay-detail.open{display:block}
+.toggle-detail{background:none;border:none;color:var(--amber);font-size:.82rem;cursor:pointer;padding:0;font-family:var(--sans)}
+.parlay-figures{text-align:right;flex-shrink:0}
+.odds-figure{font-family:var(--serif);font-size:1.5rem;font-variant-numeric:tabular-nums;color:var(--amber)}
+.ev-tag{display:inline-block;margin-top:6px;font-size:.75rem;padding:3px 8px;border-radius:3px}
+.ev-tag.pos{color:var(--green);border:1px solid rgba(111,191,139,.4)}
+.ev-tag.neg{color:var(--red);border:1px solid rgba(201,106,92,.4)}
+.board-foot{margin-top:40px;color:var(--text-muted);font-size:.78rem;max-width:65ch}
+@media (max-width:620px){.board-head{flex-direction:column;align-items:flex-start}.board-head-stat{align-items:flex-start}.parlay-row{grid-template-columns:40px 1fr}.parlay-figures{grid-column:1/-1;text-align:left;margin-top:6px}}
+</style>
+</head>
+<body>
+<div class="board">
+<header class="board-head">
+<div class="board-head-text">
+<p class="eyebrow">Today's slate, ranked by modeled edge</p>
+<h1>Longshot Board</h1>
+<p class="sub">Pulls live player-prop lines, de-vigs every two-sided market to estimate true probability, then assembles parlays near your target price and ranks them by expected value — not just by which one pays the most.</p>
+</div>
+<div class="board-head-stat" id="headline-stat"><span class="stat-number">—</span><span class="stat-label">parlays found</span></div>
+</header>
+<section class="controls">
+<div class="control-group" id="sport-toggles" aria-label="Sports to include"></div>
+<div class="control-group control-target"><label for="target-odds">Target odds</label><input type="text" id="target-odds" value="+1000" /></div>
+<button id="scan-btn" class="scan-btn">Scan market</button>
+<span class="scan-meta" id="scan-meta"></span>
+</section>
+<main id="results" class="results" aria-live="polite"><p class="empty-state">Press "Scan market" to pull today's props and build the board.</p></main>
+<footer class="board-foot"><p>Modeled EV assumes independent legs and de-vigged consensus pricing. Longshot parlays are volume products for sportsbooks — even the best-ranked combo here is very likely still negative EV. Treat this as a research ranking, not a guarantee.</p></footer>
+</div>
+<script>
+const sportTogglesEl=document.getElementById("sport-toggles"),resultsEl=document.getElementById("results"),scanBtn=document.getElementById("scan-btn"),scanMetaEl=document.getElementById("scan-meta"),headlineStatEl=document.querySelector("#headline-stat .stat-number"),targetOddsInput=document.getElementById("target-odds");
+let activeSports=new Set();
+async function loadSports(){const sports=await fetch("/api/sports").then(r=>r.json());sportTogglesEl.innerHTML="";sports.forEach(({key,label})=>{activeSports.add(key);const chip=document.createElement("span");chip.className="sport-chip active";chip.textContent=label;chip.dataset.key=key;chip.addEventListener("click",()=>{if(activeSports.has(key)){activeSports.delete(key);chip.classList.remove("active")}else{activeSports.add(key);chip.classList.add("active")}});sportTogglesEl.appendChild(chip)})}
+function parseTargetOdds(raw){const n=parseInt(raw.replace(/[^0-9-]/g,""),10);return Number.isFinite(n)?Math.abs(n):1000}
+function formatAmerican(n){return n>0?"+"+n:""+n}
+function escapeHtml(str){const div=document.createElement("div");div.textContent=str;return div.innerHTML}
+function renderParlays(parlays){resultsEl.innerHTML="";if(!parlays.length){resultsEl.innerHTML='<p class="empty-state">No combos landed near that target with the current pool. Try widening the target odds or adding more sports.</p>';return}
+parlays.forEach((p,i)=>{const row=document.createElement("article");row.className="parlay-row";const legsPreview=p.legs.map(l=>(l.player+" "+l.side+" "+(l.point??"")).trim()).join(" · ");const evPct=(p.evPerDollar*100).toFixed(1);const evClass=p.evPerDollar>=-0.05?"pos":"neg";row.innerHTML='<div class="rank">'+(i+1)+'</div><div class="parlay-main"><h3>'+p.legs.length+'-leg parlay</h3><p class="parlay-legs-preview">'+legsPreview+'</p><button class="toggle-detail">Show research</button><div class="parlay-detail">'+escapeHtml(p.explanation)+'</div></div><div class="parlay-figures"><div class="odds-figure">'+formatAmerican(p.combinedAmerican)+'</div><div class="ev-tag '+evClass+'">'+(evPct>=0?"+":"")+evPct+'% EV</div></div>';row.querySelector(".toggle-detail").addEventListener("click",(e)=>{const detail=row.querySelector(".parlay-detail");const open=detail.classList.toggle("open");e.target.textContent=open?"Hide research":"Show research"});resultsEl.appendChild(row)})}
+async function scan(){if(!activeSports.size){scanMetaEl.textContent="Select at least one sport.";return}
+scanBtn.disabled=true;scanBtn.textContent="Scanning…";resultsEl.innerHTML='<p class="empty-state">Pulling live prop lines and building combos…</p>';
+const target=parseTargetOdds(targetOddsInput.value);const sportsParam=[...activeSports].join(",");
+try{const res=await fetch("/api/scan?sports="+sportsParam+"&target="+target);const data=await res.json();
+if(data.error){resultsEl.innerHTML='<p class="empty-state">'+escapeHtml(data.error)+'</p>';headlineStatEl.textContent="—";return}
+if(data.message){resultsEl.innerHTML='<p class="empty-state">'+escapeHtml(data.message)+'</p>'}else{renderParlays(data.parlays)}
+headlineStatEl.textContent=data.parlays?data.parlays.length:"0";const scanned=data.scanned||{};scanMetaEl.textContent=(scanned.events??0)+" events scanned · "+(scanned.legsFound??0)+" legs found"+(data.cached?" · cached":"")
+}catch(err){resultsEl.innerHTML='<p class="empty-state">Scan failed: '+escapeHtml(err.message)+'</p>'}finally{scanBtn.disabled=false;scanBtn.textContent="Scan market"}}
+scanBtn.addEventListener("click",scan);loadSports();
+</script>
+</body>
+</html>`;
+
+app.listen(PORT, () => {
+  console.log(`Prop scanner running on port ${PORT}`);
+});
