@@ -134,6 +134,12 @@ async function getEventPlayerProps(sportKey, eventId, markets, regions) {
 
 const ONE_SIDED_MARKETS = new Set(["player_anytime_td", "player_1st_td", "player_last_td"]);
 
+// Books known for tight, efficient pricing get more weight in the de-vig
+// average — a sharp book's price reflects sharper market consensus than a
+// slower-to-move retail book, so it's a better estimate of true probability.
+const SHARP_BOOK_WEIGHT = 3;
+const SHARP_BOOKS = new Set(["Pinnacle", "Circa Sports", "BetOnline.ag"]);
+
 function legKey(market, player, point) {
   return `${market}::${player}::${point}`;
 }
@@ -170,14 +176,44 @@ function normalizeEventOdds(eventData, sportKey, sportLabel) {
       let trueProb;
       let devigged = false;
       if (!oneSided && opposite && opposite.length) {
-        const pairedTrueProbs = quotes.map((q) => {
-          const oppForBook = opposite.find((o) => o.book === q.book) || opposite[0];
-          return devigTwoWay(q.american, oppForBook.american).trueProbA;
-        });
-        trueProb = pairedTrueProbs.reduce((a, b) => a + b, 0) / pairedTrueProbs.length;
-        devigged = true;
+        // Only pair a book's price against THAT SAME book's opposite-side price.
+        // Pairing across different books (the old fallback) can mismatch a
+        // generous book's price against a stingy book's opposite price and
+        // produce a fabricated "edge" that isn't real.
+        const pairedTrueProbs = [];
+        for (const q of quotes) {
+          const oppForBook = opposite.find((o) => o.book === q.book);
+          if (!oppForBook) continue;
+          const { trueProbA, overround } = devigTwoWay(q.american, oppForBook.american);
+          // A real two-sided market's implied probabilities sum to slightly
+          // ABOVE 100% (that's the vig). A sum outside ~98%-130% means these
+          // two prices aren't real complements of each other — reject the pairing
+          // rather than let it produce a fabricated probability.
+          if (overround < 0.98 || overround > 1.3) continue;
+          const weight = SHARP_BOOKS.has(q.book) ? SHARP_BOOK_WEIGHT : 1;
+          pairedTrueProbs.push({ trueProbA, weight });
+        }
+        if (pairedTrueProbs.length) {
+          const totalWeight = pairedTrueProbs.reduce((a, p) => a + p.weight, 0);
+          trueProb = pairedTrueProbs.reduce((a, p) => a + p.trueProbA * p.weight, 0) / totalWeight;
+          devigged = true;
+        } else {
+          // No single book quoted both sides — can't de-vig reliably, fall back to raw implied.
+          trueProb = americanToImpliedProb(best.american);
+        }
       } else {
         trueProb = americanToImpliedProb(best.american);
+      }
+
+      const impliedBest = americanToImpliedProb(best.american);
+      // Sanity clamp: a real de-vig shift this large on a liquid market is
+      // implausible and more likely a data/pairing issue than a true edge.
+      const MAX_PLAUSIBLE_SWING = 0.10;
+      let suspect = false;
+      if (devigged && Math.abs(trueProb - impliedBest) > MAX_PLAUSIBLE_SWING) {
+        trueProb = impliedBest;
+        devigged = false;
+        suspect = true;
       }
 
       legs.push({
@@ -186,9 +222,9 @@ function normalizeEventOdds(eventData, sportKey, sportLabel) {
         matchup: `${away_team} @ ${home_team}`,
         market, player, side, point,
         bestAmerican: best.american, bestBook: best.book, numBooks: quotes.length,
-        impliedProbBest: americanToImpliedProb(best.american),
-        trueProb, devigged,
-        edge: trueProb - americanToImpliedProb(best.american),
+        impliedProbBest: impliedBest,
+        trueProb, devigged, suspect,
+        edge: trueProb - impliedBest,
       });
     }
   }
@@ -310,7 +346,7 @@ function buildParlays(allLegs, options = {}) {
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const rng = Math.random;
   const pool = allLegs.filter(
-    (l) => l.numBooks >= opts.minBooksPerLeg && l.trueProb >= opts.minTrueProb && l.trueProb <= opts.maxTrueProb
+    (l) => !l.suspect && l.numBooks >= opts.minBooksPerLeg && l.trueProb >= opts.minTrueProb && l.trueProb <= opts.maxTrueProb
   );
 
   const seen = new Set();
@@ -399,6 +435,93 @@ function explainParlay(parlay) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────
+   RESULTS TRACKING
+   Every fresh scan logs its top parlays to disk. There's no free box-score
+   API wired in here, so grading is manual — you (or whoever) mark each leg
+   win/loss/push after the game. What this buys you: a calibration report
+   comparing the model's stated probability against what actually happened,
+   which is the only real way to know if "de-vigged 55%" means anything.
+──────────────────────────────────────────────────────────────────────── */
+
+const PICKS_LOG_PATH = process.env.PICKS_LOG_PATH || "/data/picks-log.json";
+const MAX_LOGGED_PICKS = 500; // keep the file bounded; oldest picks drop off
+
+let picksWriteWarned = false;
+
+function loadPicksLog() {
+  try {
+    return JSON.parse(fs.readFileSync(PICKS_LOG_PATH, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+function savePicksLog(picks) {
+  try {
+    fs.writeFileSync(PICKS_LOG_PATH, JSON.stringify(picks));
+  } catch (err) {
+    if (!picksWriteWarned) {
+      console.warn(`Picks log not persisted (${err.message}) — results tracking disabled until this is fixed.`);
+      picksWriteWarned = true;
+    }
+  }
+}
+
+function logPicks(parlays) {
+  const picks = loadPicksLog();
+  const now = new Date().toISOString();
+  parlays.forEach((p, i) => {
+    picks.push({
+      id: `${Date.now()}_${i}`,
+      generatedAt: now,
+      combinedAmerican: p.combinedAmerican,
+      trueProbability: p.trueProbability,
+      evPerDollar: p.evPerDollar,
+      legs: p.legs.map((l) => ({
+        id: l.id, player: l.player, side: l.side, point: l.point, market: l.market,
+        matchup: l.matchup, bestAmerican: l.bestAmerican, trueProb: l.trueProb,
+        devigged: l.devigged, commenceTime: l.commenceTime,
+      })),
+      graded: false,
+      result: null,
+      legResults: {},
+      gradedAt: null,
+    });
+  });
+  const trimmed = picks.slice(-MAX_LOGGED_PICKS);
+  savePicksLog(trimmed);
+}
+
+/** Overall parlay result from per-leg win/loss/push calls. Pushes are dropped (standard parlay rule); the parlay wins only if every remaining leg wins. */
+function gradeParlayResult(legResults, legIds) {
+  const calls = legIds.map((id) => legResults[id]).filter(Boolean);
+  if (calls.length < legIds.length) return null; // not fully graded yet
+  const active = calls.filter((c) => c !== "push");
+  if (!active.length) return "push"; // everything pushed
+  if (active.includes("loss")) return "loss";
+  return "win";
+}
+
+function computeTrackRecord() {
+  const picks = loadPicksLog().filter((p) => p.graded);
+  if (!picks.length) {
+    return { gradedCount: 0, hitRate: null, avgModeledProbability: null, avgEvPerDollar: null, realizedEvPerDollar: null };
+  }
+  const wins = picks.filter((p) => p.result === "win").length;
+  const decided = picks.filter((p) => p.result === "win" || p.result === "loss");
+  const hitRate = decided.length ? wins / decided.length : null;
+  const avgModeledProbability = picks.reduce((a, p) => a + p.trueProbability, 0) / picks.length;
+  const avgEvPerDollar = picks.reduce((a, p) => a + p.evPerDollar, 0) / picks.length;
+  // Realized EV: what actually happened, using each pick's own payout multiple on wins.
+  const realizedEvPerDollar =
+    decided.reduce((a, p) => {
+      const decimal = americanToDecimal(p.combinedAmerican);
+      return a + (p.result === "win" ? decimal - 1 : -1);
+    }, 0) / (decided.length || 1);
+  return { gradedCount: picks.length, decidedCount: decided.length, hitRate, avgModeledProbability, avgEvPerDollar, realizedEvPerDollar };
+}
+
+/* ────────────────────────────────────────────────────────────────────────
    SERVER
 ──────────────────────────────────────────────────────────────────────── */
 
@@ -469,6 +592,7 @@ app.get("/api/scan", async (req, res) => {
     }
     const parlays = buildParlays(allLegs, { targetAmericanOdds: targetOdds });
     const withExplanations = parlays.map((p) => ({ ...p, explanation: explainParlay(p) }));
+    logPicks(parlays);
     const payload = { parlays: withExplanations, scanned: { ...scanned, legsFound: allLegs.length }, generatedAt: new Date().toISOString() };
     cache = { key: cacheKey, timestamp: Date.now(), data: payload };
     res.json({ ...payload, cached: false });
@@ -480,6 +604,48 @@ app.get("/api/scan", async (req, res) => {
 
 app.get("/api/sports", (req, res) => {
   res.json(Object.entries(SPORTS).map(([key, v]) => ({ key, label: v.label })));
+});
+
+app.get("/api/picks", (req, res) => {
+  const status = req.query.status || "ungraded";
+  const limit = Math.min(Number(req.query.limit) || 20, 100);
+  let picks = loadPicksLog();
+  if (status === "ungraded") picks = picks.filter((p) => !p.graded);
+  else if (status === "graded") picks = picks.filter((p) => p.graded);
+  picks = picks.slice(-limit).reverse();
+  res.json(picks);
+});
+
+app.post("/api/picks/:id/grade", (req, res) => {
+  const { legResults } = req.body || {};
+  if (!legResults || typeof legResults !== "object") {
+    return res.status(400).json({ error: "Body must include legResults: { legId: 'win'|'loss'|'push' }" });
+  }
+  const picks = loadPicksLog();
+  const pick = picks.find((p) => p.id === req.params.id);
+  if (!pick) return res.status(404).json({ error: "Pick not found" });
+
+  const legIds = pick.legs.map((l) => l.id);
+  const validCalls = ["win", "loss", "push"];
+  for (const [legId, call] of Object.entries(legResults)) {
+    if (!legIds.includes(legId) || !validCalls.includes(call)) {
+      return res.status(400).json({ error: `Invalid legId or result: ${legId} -> ${call}` });
+    }
+    pick.legResults[legId] = call;
+  }
+
+  const result = gradeParlayResult(pick.legResults, legIds);
+  if (result) {
+    pick.result = result;
+    pick.graded = true;
+    pick.gradedAt = new Date().toISOString();
+  }
+  savePicksLog(picks);
+  res.json(pick);
+});
+
+app.get("/api/track-record", (req, res) => {
+  res.json(computeTrackRecord());
 });
 
 app.get("/", (req, res) => {
@@ -541,6 +707,7 @@ h1{font-family:var(--serif);font-weight:600;font-size:clamp(2.2rem,5vw,3.2rem);m
 <p class="eyebrow">Today's slate, ranked by modeled edge</p>
 <h1>Longshot Board</h1>
 <p class="sub">Pulls live player-prop lines, de-vigs every two-sided market to estimate true probability, then assembles parlays near your target price and ranks them by expected value — not just by which one pays the most.</p>
+<p class="sub"><a href="/history" style="color:var(--amber)">Track record & grade picks →</a></p>
 </div>
 <div class="board-head-stat" id="headline-stat"><span class="stat-number">—</span><span class="stat-label">parlays found</span></div>
 </header>
@@ -575,6 +742,129 @@ scanBtn.addEventListener("click",scan);loadSports();
 </body>
 </html>`;
 
+app.get("/history", (req, res) => {
+  res.type("html").send(HISTORY_HTML);
+});
+
+const HISTORY_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Track Record — Longshot Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+:root{--ink:#0f1b22;--panel:#16262f;--hairline:#2c414c;--amber:#e8a33d;--amber-dim:#a97a33;--green:#6fbf8b;--red:#c96a5c;--text:#ede9df;--text-muted:#8fa3ac;--serif:"Fraunces",Georgia,serif;--sans:"IBM Plex Sans",system-ui,sans-serif}
+*{box-sizing:border-box}html{color-scheme:dark}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--sans);line-height:1.5}
+.board{max-width:880px;margin:0 auto;padding:48px 24px 80px}
+.eyebrow{color:var(--amber);font-size:.85rem;margin:0 0 10px}
+h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.8rem,5vw,2.6rem);margin:0 0 20px}
+a{color:var(--amber)}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:16px;padding:20px 0;border-bottom:1px solid var(--hairline);margin-bottom:24px}
+.stat{background:var(--panel);border:1px solid var(--hairline);border-radius:4px;padding:14px}
+.stat-num{font-family:var(--serif);font-size:1.6rem;color:var(--amber);font-variant-numeric:tabular-nums}
+.stat-label{color:var(--text-muted);font-size:.78rem;margin-top:4px}
+h2{font-family:var(--serif);font-size:1.2rem;margin:32px 0 12px}
+.pick-card{background:var(--panel);border:1px solid var(--hairline);border-radius:4px;padding:16px;margin-bottom:14px}
+.pick-head{display:flex;justify-content:space-between;color:var(--text-muted);font-size:.8rem;margin-bottom:10px}
+.leg-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--hairline)}
+.leg-name{font-size:.9rem}
+.leg-btns{display:flex;gap:6px}
+.leg-btns button{background:none;border:1px solid var(--hairline);color:var(--text-muted);font-size:.75rem;padding:4px 10px;border-radius:3px;cursor:pointer;font-family:var(--sans)}
+.leg-btns button.active-win{border-color:var(--green);color:var(--green)}
+.leg-btns button.active-loss{border-color:var(--red);color:var(--red)}
+.leg-btns button.active-push{border-color:var(--amber-dim);color:var(--amber)}
+.save-btn{margin-top:12px;background:var(--amber);color:#17222a;border:none;font-weight:600;font-size:.85rem;padding:8px 16px;border-radius:4px;cursor:pointer;font-family:var(--sans)}
+.empty-state{color:var(--text-muted);padding:20px 0}
+.result-tag{font-size:.78rem;padding:2px 8px;border-radius:3px}
+.result-tag.win{color:var(--green);border:1px solid rgba(111,191,139,.4)}
+.result-tag.loss{color:var(--red);border:1px solid rgba(201,106,92,.4)}
+.result-tag.push{color:var(--amber);border:1px solid rgba(232,163,61,.4)}
+</style>
+</head>
+<body>
+<div class="board">
+<p class="eyebrow"><a href="/">← Back to board</a></p>
+<h1>Track Record</h1>
+<div class="stats-grid" id="stats-grid"><p class="empty-state">Loading…</p></div>
+<h2>Ungraded picks</h2>
+<div id="ungraded-list"><p class="empty-state">Loading…</p></div>
+<h2>Recently graded</h2>
+<div id="graded-list"><p class="empty-state">Loading…</p></div>
+</div>
+<script>
+function fmtPct(x){return x==null?"—":(x*100).toFixed(1)+"%"}
+function fmtAmerican(n){return n>0?"+"+n:""+n}
+function escapeHtml(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
+
+async function loadStats(){
+  const s = await fetch("/api/track-record").then(r=>r.json());
+  const grid = document.getElementById("stats-grid");
+  if(!s.gradedCount){ grid.innerHTML = '<p class="empty-state">No graded picks yet — grade some below once games finish.</p>'; return; }
+  grid.innerHTML = [
+    ["Graded picks", s.gradedCount],
+    ["Hit rate", fmtPct(s.hitRate)],
+    ["Avg modeled probability", fmtPct(s.avgModeledProbability)],
+    ["Avg modeled EV", fmtPct(s.avgEvPerDollar)],
+    ["Realized EV per $1", fmtPct(s.realizedEvPerDollar)],
+  ].map(([label,val]) => '<div class="stat"><div class="stat-num">'+val+'</div><div class="stat-label">'+label+'</div></div>').join("");
+}
+
+async function loadUngraded(){
+  const picks = await fetch("/api/picks?status=ungraded&limit=15").then(r=>r.json());
+  const el = document.getElementById("ungraded-list");
+  if(!picks.length){ el.innerHTML = '<p class="empty-state">Nothing to grade — everything logged so far is graded, or no scans have run yet.</p>'; return; }
+  el.innerHTML = "";
+  picks.forEach(pick => {
+    const card = document.createElement("div");
+    card.className = "pick-card";
+    const legsHtml = pick.legs.map(l => 
+      '<div class="leg-row"><span class="leg-name">'+escapeHtml(l.player+" "+l.side+" "+(l.point??"")+" — "+l.matchup)+'</span>'+
+      '<span class="leg-btns" data-leg="'+l.id+'">'+
+        '<button data-call="win">Win</button><button data-call="loss">Loss</button><button data-call="push">Push</button>'+
+      '</span></div>'
+    ).join("");
+    card.innerHTML = '<div class="pick-head"><span>'+new Date(pick.generatedAt).toLocaleString()+'</span><span>'+fmtAmerican(pick.combinedAmerican)+' · modeled '+fmtPct(pick.trueProbability)+'</span></div>'+legsHtml+'<button class="save-btn">Save grade</button>';
+    const calls = {};
+    card.querySelectorAll(".leg-btns").forEach(group => {
+      const legId = group.dataset.leg;
+      group.querySelectorAll("button").forEach(btn => {
+        btn.addEventListener("click", () => {
+          calls[legId] = btn.dataset.call;
+          group.querySelectorAll("button").forEach(b => b.className = "");
+          btn.className = "active-" + btn.dataset.call;
+        });
+      });
+    });
+    card.querySelector(".save-btn").addEventListener("click", async () => {
+      if(!Object.keys(calls).length){ alert("Mark at least one leg first."); return; }
+      await fetch("/api/picks/"+pick.id+"/grade", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({legResults: calls}) });
+      loadUngraded(); loadStats(); loadGraded();
+    });
+    el.appendChild(card);
+  });
+}
+
+async function loadGraded(){
+  const picks = await fetch("/api/picks?status=graded&limit=15").then(r=>r.json());
+  const el = document.getElementById("graded-list");
+  if(!picks.length){ el.innerHTML = '<p class="empty-state">Nothing graded yet.</p>'; return; }
+  el.innerHTML = picks.map(pick => 
+    '<div class="pick-card"><div class="pick-head"><span>'+new Date(pick.generatedAt).toLocaleString()+'</span>'+
+    '<span class="result-tag '+pick.result+'">'+pick.result.toUpperCase()+'</span></div>'+
+    '<div style="color:var(--text-muted);font-size:.85rem">'+fmtAmerican(pick.combinedAmerican)+' · modeled '+fmtPct(pick.trueProbability)+' · '+pick.legs.length+' legs</div></div>'
+  ).join("");
+}
+
+loadStats(); loadUngraded(); loadGraded();
+</script>
+</body>
+</html>`;
+
 app.listen(PORT, () => {
   console.log(`Prop scanner running on port ${PORT}`);
 });
+
