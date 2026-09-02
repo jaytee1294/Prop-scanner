@@ -915,6 +915,8 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.08rem;margin:0 0 10px;co
 </style>
 </head>
 <body>
+<div id="js-canary" style="background:#c0392b;color:#fff;padding:16px;font-family:monospace;font-size:14px;text-align:center;font-weight:bold">JAVASCRIPT DID NOT RUN ON THIS PAGE</div>
+<script>document.getElementById('js-canary').remove();</script>
 <div class="board">
 <header>
 <div class="masthead">
