@@ -246,8 +246,21 @@ function requireKey() {
   return key;
 }
 
+// The Odds API returns exact quota usage on every response header — track
+// the most recent values so we can surface real numbers instead of guessing.
+const apiQuota = { remaining: null, used: null, lastCost: null, updatedAt: null };
+
 async function getJson(url) {
   const res = await fetchWithTimeout(url, {}, 8000);
+  const remaining = res.headers.get("x-requests-remaining");
+  const used = res.headers.get("x-requests-used");
+  const lastCost = res.headers.get("x-requests-last");
+  if (remaining != null) {
+    apiQuota.remaining = Number(remaining);
+    apiQuota.used = Number(used);
+    apiQuota.lastCost = Number(lastCost);
+    apiQuota.updatedAt = new Date().toISOString();
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new OddsApiError(`Odds API request failed (${res.status}): ${body}`, res.status);
@@ -873,12 +886,19 @@ app.get("/api/scan", async (req, res) => {
     applyLineMovement(allLegs);
     if (!allLegs.length) {
       const authError = scanned.errors.find((e) => e.status === 401);
-      return res.status(200).json({
-        parlays: [], scanned,
-        message: authError
-          ? "No ODDS_API_KEY configured — set it as an environment variable."
-          : "No player-prop legs came back for the requested sports right now (off-slate day, or books haven't posted props yet).",
-      });
+      const quotaError = scanned.errors.find((e) => e.status === 429);
+      const otherError = scanned.errors.find((e) => e.status && e.status !== 401 && e.status !== 429);
+      let message;
+      if (authError) {
+        message = "No ODDS_API_KEY configured — set it as an environment variable.";
+      } else if (quotaError) {
+        message = `Odds API quota exceeded (429) — you're out of requests for this billing period. Current usage: ${apiQuota.used ?? "unknown"} used, ${apiQuota.remaining ?? "unknown"} remaining. Check your plan at the-odds-api.com/account.`;
+      } else if (otherError) {
+        message = `Odds API returned an error (${otherError.status}): ${otherError.message}`;
+      } else {
+        message = "No player-prop legs came back for the requested sports right now (off-slate day, or books haven't posted props yet).";
+      }
+      return res.status(200).json({ parlays: [], scanned, apiQuota, message });
     }
     const buildResult = buildParlays(allLegs, filterOpts);
     const withExplanations = buildResult.parlays.map((p) => ({ ...p, explanation: explainParlay(p) }));
@@ -896,6 +916,7 @@ app.get("/api/scan", async (req, res) => {
       scanned: { ...scanned, legsFound: allLegs.length },
       qualifyingLegsCount: buildResult.qualifyingLegsCount,
       poolSizeBeforeFilters: buildResult.poolSizeBeforeFilters,
+      apiQuota,
       message,
       generatedAt: new Date().toISOString(),
     };
@@ -905,6 +926,10 @@ app.get("/api/scan", async (req, res) => {
     const status = err instanceof OddsApiError ? err.status : 500;
     res.status(status).json({ error: err.message });
   }
+});
+
+app.get("/api/quota", (req, res) => {
+  res.json(apiQuota);
 });
 
 app.get("/api/sports", (req, res) => {
@@ -1144,7 +1169,9 @@ async function scan(){
     const scanned=data.scanned||{};
     tickerEl.innerHTML='<span><b>'+count+'</b> parlays found</span><span>'+(scanned.events??0)+' events scanned</span><span>'+(scanned.legsFound??0)+' legs found</span>'+(data.cached?'<span>cached</span>':'<span>live</span>');
     const books=scanned.booksObserved||[];
-    scanMetaEl.textContent=books.length?("Books this scan: "+books.join(", ")):"";
+    const q=data.apiQuota;
+    const quotaText=q&&q.remaining!=null?(" · Odds API: "+q.remaining+" requests remaining"):"";
+    scanMetaEl.textContent=(books.length?("Books this scan: "+books.join(", ")):"")+quotaText;
   }catch(err){
     resultsEl.innerHTML='<p class="empty-state">Scan failed: '+escapeHtml(err.message)+'</p>';
   }finally{
