@@ -267,8 +267,14 @@ const ONE_SIDED_MARKETS = new Set(["player_anytime_td", "player_1st_td", "player
 // Books known for tight, efficient pricing get more weight in the de-vig
 // average — a sharp book's price reflects sharper market consensus than a
 // slower-to-move retail book, so it's a better estimate of true probability.
-const SHARP_BOOK_WEIGHT = 3;
-const SHARP_BOOKS = new Set(["Pinnacle", "Circa Sports", "BetOnline.ag"]);
+// IMPORTANT: The Odds API's `us` region does NOT include Pinnacle (US-unlicensed)
+// or Circa Sports, so those don't help here despite being the "textbook" sharp
+// picks. Bovada and MyBookie.ag are the offshore books actually confirmed present
+// in `us` region data — not gold-standard sharps, but real and verifiable, which
+// beats guessing at names that silently match nothing. Cross-check this list
+// against BOOKS_OBSERVED (surfaced in the scan response) if book coverage changes.
+const SHARP_BOOK_WEIGHT = 2;
+const SHARP_BOOKS = new Set(["Bovada", "MyBookie.ag"]);
 
 function legKey(market, player, point) {
   return `${market}::${player}::${point}`;
@@ -667,6 +673,7 @@ let cache = { key: null, timestamp: 0, data: null };
 async function scanSports(sportKeys) {
   const allLegs = [];
   const scanned = { events: 0, sportsWithData: [], errors: [] };
+  const booksObserved = new Set();
 
   for (const sportKey of sportKeys) {
     const config = SPORTS[sportKey];
@@ -688,6 +695,7 @@ async function scanSports(sportKeys) {
       try {
         const oddsData = await getEventPlayerProps(sportKey, event.id, config.markets, DEFAULT_REGIONS);
         const legs = normalizeEventOdds(oddsData, sportKey, config.label);
+        (oddsData.bookmakers || []).forEach((b) => booksObserved.add(b.title));
 
         const venue = getVenue(oddsData.home_team, sportKey);
         if (venue && !venue.indoor) {
@@ -704,6 +712,7 @@ async function scanSports(sportKeys) {
     }
     if (sportHadLegs) scanned.sportsWithData.push(config.label);
   }
+  scanned.booksObserved = [...booksObserved].sort();
   return { allLegs, scanned };
 }
 
@@ -798,78 +807,90 @@ const DASHBOARD_HTML = `<!doctype html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Longshot Board</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1720'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='20' font-weight='700' fill='%23f0a84e' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23071310'/%3E%3Cpolyline points='6,20 12,14 16,17 26,7' fill='none' stroke='%233ddc84' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='26' cy='7' r='2.2' fill='%233ddc84'/%3E%3C/svg%3E" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
 <style>
 :root{
-  --ink:#0d1720; --ink-raised:#15222c; --ink-raised-2:#1b2b38;
-  --hairline:#24343f; --hairline-bright:#37505f;
-  --amber:#f0a84e; --amber-deep:#b97a2e; --amber-dim:#8a6640;
-  --green:#7fcf9e; --red:#d97a6c;
-  --text:#f1ece0; --text-dim:#8fa1ab;
+  /* grounded in old phosphor-CRT trading terminals: green signal on a
+     near-black screen that actually has hue in it, not neutral grey-black */
+  --ink:#071310; --ink-raised:#0f1f19; --ink-raised-2:#15281f;
+  --hairline:#1f3a2c; --hairline-bright:#2f5a41;
+  --green:#3ddc84; --green-deep:#1f8f52; --green-dim:#5c8f74;
+  --red:#e08579;
+  --gold:#d4af37; --silver:#adb8b6; --bronze:#c9834a;
+  --text:#eaf3ea; --text-dim:#7ea08c;
   --serif:"Fraunces",Georgia,serif; --sans:"IBM Plex Sans",system-ui,sans-serif; --mono:"IBM Plex Mono",monospace;
 }
 *{box-sizing:border-box}
 html{color-scheme:dark}
-body{margin:0;background:var(--ink);color:var(--text);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
-a{color:var(--amber)}
-:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--mono);line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:var(--green)}
+:focus-visible{outline:2px solid var(--green);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
 .board{max-width:900px;margin:0 auto;padding:40px 20px 90px}
 
-/* header: masthead + ticker line, no isolated giant stat block */
 .masthead{display:flex;align-items:center;gap:12px}
-.mark{width:34px;height:34px;flex-shrink:0;border-radius:7px;background:linear-gradient(155deg,var(--amber) 0%,var(--amber-deep) 100%);display:flex;align-items:center;justify-content:center;font-family:var(--serif);font-weight:700;font-size:1.15rem;color:#12202a}
-h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.7rem,4.6vw,2.35rem);margin:0;letter-spacing:-.01em}
-.ticker{margin:14px 0 4px;color:var(--text-dim);font-size:.86rem;font-family:var(--mono);display:flex;flex-wrap:wrap;gap:6px 14px}
-.ticker b{color:var(--amber);font-weight:600}
-.dek{color:var(--text-dim);max-width:58ch;margin:14px 0 0;font-size:.95rem}
+.mark{width:34px;height:34px;flex-shrink:0;border-radius:7px;background:var(--ink-raised);border:1px solid var(--hairline-bright);display:flex;align-items:center;justify-content:center}
+.mark svg{width:20px;height:20px}
+h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.7rem,4.6vw,2.35rem);margin:0;letter-spacing:-.01em;font-family:var(--serif)}
+.ticker{margin:14px 0 4px;color:var(--text-dim);font-size:.84rem;display:flex;flex-wrap:wrap;gap:6px 14px}
+.ticker b{color:var(--green);font-weight:600}
+.dek{color:var(--text-dim);max-width:58ch;margin:14px 0 0;font-size:.95rem;font-family:var(--sans)}
 .dek a{white-space:nowrap}
 
-/* controls: command-bar feel */
 .controls{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-top:26px;padding:16px 18px;background:var(--ink-raised);border:1px solid var(--hairline);border-radius:10px}
 .control-group{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.sport-chip{position:relative;display:inline-flex;align-items:center;gap:7px;padding:6px 13px 6px 11px;border:1px solid var(--hairline-bright);border-radius:99px;font-size:.82rem;cursor:pointer;color:var(--text-dim);user-select:none;background:transparent;transition:background .15s,color .15s,border-color .15s}
+.sport-chip{position:relative;display:inline-flex;align-items:center;gap:7px;padding:6px 13px 6px 11px;border:1px solid var(--hairline-bright);border-radius:99px;font-size:.8rem;cursor:pointer;color:var(--text-dim);user-select:none;background:transparent;transition:background .15s,color .15s,border-color .15s}
 .sport-chip .dot{width:6px;height:6px;border-radius:50%;background:var(--hairline-bright);transition:background .15s}
-.sport-chip.active{border-color:var(--amber-deep);color:var(--text);background:rgba(240,168,78,.12)}
-.sport-chip.active .dot{background:var(--amber)}
+.sport-chip.active{border-color:var(--green-deep);color:var(--text);background:rgba(61,220,132,.1)}
+.sport-chip.active .dot{background:var(--green);box-shadow:0 0 6px rgba(61,220,132,.7)}
 .control-target{display:flex;align-items:center;gap:8px}
-.control-target label{font-size:.8rem;color:var(--text-dim)}
-#target-odds{background:var(--ink);border:1px solid var(--hairline-bright);color:var(--amber);font-family:var(--mono);font-size:.88rem;padding:7px 10px;border-radius:6px;width:88px}
-.scan-btn{background:var(--amber);color:#17222a;border:none;font-family:var(--sans);font-weight:600;font-size:.88rem;padding:10px 20px;border-radius:7px;cursor:pointer;margin-left:auto;box-shadow:0 1px 0 rgba(0,0,0,.2),0 0 0 1px rgba(240,168,78,.35);transition:transform .1s,box-shadow .15s}
-.scan-btn:hover{box-shadow:0 1px 0 rgba(0,0,0,.2),0 0 20px rgba(240,168,78,.35),0 0 0 1px rgba(240,168,78,.5)}
+.control-target label{font-size:.78rem;color:var(--text-dim)}
+#target-odds{background:var(--ink);border:1px solid var(--hairline-bright);color:var(--green);font-family:var(--mono);font-size:.86rem;padding:7px 10px;border-radius:6px;width:88px}
+.scan-btn{background:var(--green);color:#07130d;border:none;font-family:var(--sans);font-weight:600;font-size:.86rem;padding:10px 20px;border-radius:7px;cursor:pointer;margin-left:auto;box-shadow:0 1px 0 rgba(0,0,0,.3),0 0 0 1px rgba(61,220,132,.4);transition:transform .1s,box-shadow .15s}
+.scan-btn:hover{box-shadow:0 1px 0 rgba(0,0,0,.3),0 0 22px rgba(61,220,132,.4),0 0 0 1px rgba(61,220,132,.6)}
 .scan-btn:active{transform:translateY(1px)}
-.scan-btn:disabled{opacity:.55;cursor:progress;box-shadow:none}
-.scan-meta{color:var(--text-dim);font-size:.76rem;font-family:var(--mono)}
+.scan-btn:disabled{opacity:.5;cursor:progress;box-shadow:none}
+.scan-meta{color:var(--text-dim);font-size:.74rem}
 
 .results{margin-top:8px}
-.empty-state{color:var(--text-dim);padding:56px 20px;text-align:center;border:1px dashed var(--hairline);border-radius:10px;margin-top:20px}
+.empty-state{color:var(--text-dim);padding:56px 20px;text-align:center;border:1px dashed var(--hairline);border-radius:10px;margin-top:20px;font-family:var(--sans)}
 
-/* result rows: left accent bar, not identical bordered cards */
-.parlay-row{display:flex;gap:18px;padding:20px 4px 20px 18px;border-left:2px solid var(--hairline);border-bottom:1px solid var(--hairline);position:relative}
-.parlay-row.top{border-left:3px solid var(--amber);background:linear-gradient(90deg,rgba(240,168,78,.07),transparent 60%)}
-.rank{font-family:var(--mono);font-weight:600;font-size:.95rem;color:var(--text-dim);width:26px;flex-shrink:0;padding-top:3px}
-.parlay-row.top .rank{color:var(--amber)}
+.parlay-row{display:flex;gap:18px;padding:20px 4px 20px 18px;border-left:2px solid var(--hairline);border-bottom:1px solid var(--hairline)}
+.parlay-row.gold{border-left:3px solid var(--gold);background:linear-gradient(90deg,rgba(212,175,55,.09),transparent 60%)}
+.parlay-row.silver{border-left:3px solid var(--silver);background:linear-gradient(90deg,rgba(173,184,182,.05),transparent 60%)}
+.parlay-row.bronze{border-left:3px solid var(--bronze);background:linear-gradient(90deg,rgba(201,131,74,.06),transparent 60%)}
+.rank{font-weight:600;font-size:.92rem;color:var(--text-dim);width:26px;flex-shrink:0;padding-top:3px}
+.parlay-row.gold .rank{color:var(--gold)}
+.parlay-row.silver .rank{color:var(--silver)}
+.parlay-row.bronze .rank{color:var(--bronze)}
 .parlay-body{flex:1;min-width:0}
-.parlay-row.top h3{font-size:1.35rem}
-h3{font-family:var(--serif);font-weight:600;font-size:1.1rem;margin:0 0 10px;color:var(--text)}
-.leg-list{list-style:none;margin:0 0 10px;padding:0;display:flex;flex-direction:column;gap:3px}
-.leg-list li{font-size:.85rem;color:var(--text-dim)}
+h3{font-family:var(--serif);font-weight:600;font-size:1.08rem;margin:0 0 10px;color:var(--text)}
+.parlay-row.gold h3{font-size:1.3rem}
+.leg-list{list-style:none;margin:0 0 10px;padding:0;display:flex;flex-direction:column;gap:3px;font-family:var(--sans)}
+.leg-list li{font-size:.85rem;color:var(--text-dim);display:flex;align-items:center;gap:6px}
 .leg-list li b{color:var(--text);font-weight:500}
-.toggle-detail{background:none;border:none;color:var(--amber);font-size:.8rem;cursor:pointer;padding:0;font-family:var(--sans);font-weight:500}
-.parlay-detail{display:none;margin-top:12px;padding:14px 16px;background:var(--ink-raised);border-radius:8px;border:1px solid var(--hairline);white-space:pre-line;font-size:.84rem;color:var(--text-dim)}
+.side-arrow{flex-shrink:0}
+.side-arrow.up path{fill:var(--green)}
+.side-arrow.down path{fill:var(--red)}
+.detail-line{margin-bottom:8px}
+.detail-line:last-child{margin-bottom:0}
+.detail-line.leg{display:flex;gap:7px;align-items:flex-start}
+.detail-line.leg .side-arrow{margin-top:4px}
+.toggle-detail{background:none;border:none;color:var(--green);font-size:.79rem;cursor:pointer;padding:0;font-family:var(--sans);font-weight:500}
+.parlay-detail{display:none;margin-top:12px;padding:14px 16px;background:var(--ink-raised);border-radius:8px;border:1px solid var(--hairline);font-size:.83rem;color:var(--text-dim);font-family:var(--sans)}
 .parlay-detail.open{display:block}
 .parlay-figures{text-align:right;flex-shrink:0;padding-top:2px}
-.odds-figure{font-family:var(--mono);font-weight:600;font-size:1.3rem;color:var(--amber)}
-.parlay-row.top .odds-figure{font-size:1.7rem}
-.ev-tag{display:inline-block;margin-top:6px;font-size:.72rem;font-family:var(--mono);padding:2px 7px;border-radius:4px}
-.ev-tag.pos{color:var(--green);background:rgba(127,207,158,.1)}
-.ev-tag.neg{color:var(--red);background:rgba(217,122,108,.1)}
+.odds-figure{font-weight:600;font-size:1.28rem;color:var(--green)}
+.parlay-row.gold .odds-figure{font-size:1.65rem;text-shadow:0 0 18px rgba(61,220,132,.35)}
+.ev-tag{display:inline-block;margin-top:6px;font-size:.71rem;padding:2px 7px;border-radius:4px}
+.ev-tag.pos{color:var(--green);background:rgba(61,220,132,.1)}
+.ev-tag.neg{color:var(--red);background:rgba(224,133,121,.1)}
 
-.board-foot{margin-top:36px;color:var(--text-dim);font-size:.78rem;max-width:65ch;line-height:1.6}
+.board-foot{margin-top:36px;color:var(--text-dim);font-size:.76rem;max-width:65ch;line-height:1.6;font-family:var(--sans)}
 
 @media (max-width:620px){
   .parlay-row{padding-left:12px;gap:12px}
@@ -880,7 +901,10 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.1rem;margin:0 0 10px;col
 <body>
 <div class="board">
 <header>
-<div class="masthead"><div class="mark">L</div><h1>Longshot Board</h1></div>
+<div class="masthead">
+<div class="mark"><svg viewBox="0 0 32 32" fill="none"><polyline points="6,20 12,14 16,17 26,7" stroke="#3ddc84" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="26" cy="7" r="2.2" fill="#3ddc84"/></svg></div>
+<h1>Longshot Board</h1>
+</div>
 <p class="ticker" id="ticker-line"><span>Live player-prop scan · press Scan market to start</span></p>
 <p class="dek">Pulls live prop lines, de-vigs every two-sided market for a true probability estimate, then ranks parlays near your target price by modeled edge — not by which one simply pays the most. <a href="/history">Track record & grade picks →</a></p>
 </header>
@@ -921,6 +945,24 @@ async function loadSports(){
 function parseTargetOdds(raw){const n=parseInt(raw.replace(/[^0-9-]/g,""),10);return Number.isFinite(n)?Math.abs(n):1000}
 function formatAmerican(n){return n>0?"+"+n:""+n}
 function escapeHtml(str){const div=document.createElement("div");div.textContent=str;return div.innerHTML}
+function sideArrow(side){
+  const isUp=side!=="Under"; // Over and Yes both read as "betting toward it happening" -> up
+  const path=isUp?"M6 1 L11 9 L1 9 Z":"M6 9 L1 1 L11 1 Z";
+  return '<svg class="side-arrow '+(isUp?"up":"down")+'" viewBox="0 0 12 10" width="9" height="8"><path d="'+path+'"/></svg>';
+}
+function renderDetail(p){
+  // Lines: [0]=summary, [1]=probability/EV, [2..2+legCount-1]=one bullet per leg
+  // (same order as p.legs), then a trailing caveat line.
+  const lines=p.explanation.split("\n");
+  const legCount=p.legs.length;
+  return lines.map((line,idx)=>{
+    const legIdx=idx-2;
+    if(legIdx>=0 && legIdx<legCount && line.startsWith("• ")){
+      return '<div class="detail-line leg">'+sideArrow(p.legs[legIdx].side)+'<span>'+escapeHtml(line.slice(2))+'</span></div>';
+    }
+    return '<div class="detail-line">'+escapeHtml(line)+'</div>';
+  }).join("");
+}
 
 function renderParlays(parlays){
   resultsEl.innerHTML="";
@@ -930,8 +972,9 @@ function renderParlays(parlays){
   }
   parlays.forEach((p,i)=>{
     const row=document.createElement("article");
-    row.className="parlay-row"+(i===0?" top":"");
-    const legsHtml=p.legs.map(l=>'<li><b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??''))+'</li>').join("");
+    const podium=i===0?" gold":i===1?" silver":i===2?" bronze":"";
+    row.className="parlay-row"+podium;
+    const legsHtml=p.legs.map(l=>'<li>'+sideArrow(l.side)+'<b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??''))+'</li>').join("");
     const evPct=(p.evPerDollar*100).toFixed(1);
     const evClass=p.evPerDollar>=-0.05?"pos":"neg";
     row.innerHTML=
@@ -940,7 +983,7 @@ function renderParlays(parlays){
         '<h3>'+p.legs.length+'-leg parlay</h3>'+
         '<ul class="leg-list">'+legsHtml+'</ul>'+
         '<button class="toggle-detail">Show research</button>'+
-        '<div class="parlay-detail">'+escapeHtml(p.explanation)+'</div>'+
+        '<div class="parlay-detail">'+renderDetail(p)+'</div>'+
       '</div>'+
       '<div class="parlay-figures">'+
         '<div class="odds-figure">'+formatAmerican(p.combinedAmerican)+'</div>'+
@@ -974,7 +1017,8 @@ async function scan(){
     const count=data.parlays?data.parlays.length:0;
     const scanned=data.scanned||{};
     tickerEl.innerHTML='<span><b>'+count+'</b> parlays found</span><span>'+(scanned.events??0)+' events scanned</span><span>'+(scanned.legsFound??0)+' legs found</span>'+(data.cached?'<span>cached</span>':'<span>live</span>');
-    scanMetaEl.textContent="";
+    const books=scanned.booksObserved||[];
+    scanMetaEl.textContent=books.length?("Books this scan: "+books.join(", ")):"";
   }catch(err){
     resultsEl.innerHTML='<p class="empty-state">Scan failed: '+escapeHtml(err.message)+'</p>';
   }finally{
@@ -998,54 +1042,56 @@ const HISTORY_HTML = `<!doctype html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Track Record — Longshot Board</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1720'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='20' font-weight='700' fill='%23f0a84e' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23071310'/%3E%3Cpolyline points='6,20 12,14 16,17 26,7' fill='none' stroke='%233ddc84' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='26' cy='7' r='2.2' fill='%233ddc84'/%3E%3C/svg%3E" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
 <style>
 :root{
-  --ink:#0d1720; --ink-raised:#15222c; --hairline:#24343f; --hairline-bright:#37505f;
-  --amber:#f0a84e; --amber-deep:#b97a2e;
-  --green:#7fcf9e; --red:#d97a6c;
-  --text:#f1ece0; --text-dim:#8fa1ab;
+  --ink:#071310; --ink-raised:#0f1f19; --hairline:#1f3a2c; --hairline-bright:#2f5a41;
+  --green:#3ddc84; --green-deep:#1f8f52;
+  --red:#e08579;
+  --text:#eaf3ea; --text-dim:#7ea08c;
   --serif:"Fraunces",Georgia,serif; --sans:"IBM Plex Sans",system-ui,sans-serif; --mono:"IBM Plex Mono",monospace;
 }
 *{box-sizing:border-box}html{color-scheme:dark}
-body{margin:0;background:var(--ink);color:var(--text);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
-a{color:var(--amber);font-size:.85rem}
-:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--mono);line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:var(--green);font-size:.85rem}
+:focus-visible{outline:2px solid var(--green);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
 .board{max-width:900px;margin:0 auto;padding:40px 20px 90px}
 h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.6rem,4.4vw,2.1rem);margin:14px 0 20px}
-h2{font-family:var(--serif);font-size:1.05rem;font-weight:600;margin:34px 0 14px;color:var(--text)}
+h2{font-family:var(--serif);font-size:1.02rem;font-weight:600;margin:34px 0 14px;color:var(--text)}
 
-/* calibration strip: one continuous ticker row, not a grid of identical boxes */
 .calibration{display:flex;flex-wrap:wrap;gap:0;background:var(--ink-raised);border:1px solid var(--hairline);border-radius:10px;overflow:hidden}
 .calibration .cell{flex:1;min-width:140px;padding:16px 18px;border-right:1px solid var(--hairline)}
 .calibration .cell:last-child{border-right:none}
-.cell .num{font-family:var(--mono);font-weight:600;font-size:1.35rem;color:var(--amber)}
-.cell .lbl{color:var(--text-dim);font-size:.75rem;margin-top:4px}
-.empty-state{color:var(--text-dim);padding:22px 4px}
+.cell .num{font-weight:600;font-size:1.3rem;color:var(--green)}
+.cell .lbl{color:var(--text-dim);font-size:.72rem;margin-top:4px;font-family:var(--sans)}
+.empty-state{color:var(--text-dim);padding:22px 4px;font-family:var(--sans)}
 
 .pick-row{display:flex;gap:14px;padding:16px 4px 16px 14px;border-left:2px solid var(--hairline);border-bottom:1px solid var(--hairline)}
 .pick-row.win{border-left-color:var(--green)}
 .pick-row.loss{border-left-color:var(--red)}
-.pick-row.push{border-left-color:var(--amber-deep)}
+.pick-row.push{border-left-color:var(--green-deep)}
 .pick-body{flex:1;min-width:0}
-.pick-meta{display:flex;gap:12px;flex-wrap:wrap;color:var(--text-dim);font-size:.78rem;font-family:var(--mono);margin-bottom:8px}
-.leg-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-top:1px solid var(--hairline);font-size:.87rem}
+.pick-meta{display:flex;gap:12px;flex-wrap:wrap;color:var(--text-dim);font-size:.76rem;margin-bottom:8px}
+.leg-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-top:1px solid var(--hairline);font-size:.85rem;font-family:var(--sans)}
+.side-arrow{flex-shrink:0}
+.side-arrow.up path{fill:var(--green)}
+.side-arrow.down path{fill:var(--red)}
 .leg-row:first-of-type{border-top:none}
 .leg-btns{display:flex;gap:6px;flex-shrink:0}
-.leg-btns button{background:none;border:1px solid var(--hairline-bright);color:var(--text-dim);font-size:.72rem;padding:4px 10px;border-radius:99px;cursor:pointer;font-family:var(--sans)}
-.leg-btns button.active-win{border-color:var(--green);color:var(--green);background:rgba(127,207,158,.1)}
-.leg-btns button.active-loss{border-color:var(--red);color:var(--red);background:rgba(217,122,108,.1)}
-.leg-btns button.active-push{border-color:var(--amber-deep);color:var(--amber);background:rgba(240,168,78,.1)}
-.save-btn{margin-top:12px;background:var(--amber);color:#17222a;border:none;font-weight:600;font-size:.82rem;padding:8px 16px;border-radius:7px;cursor:pointer;font-family:var(--sans)}
-.result-tag{font-family:var(--mono);font-size:.72rem;padding:2px 8px;border-radius:4px;flex-shrink:0;align-self:flex-start}
-.result-tag.win{color:var(--green);background:rgba(127,207,158,.1)}
-.result-tag.loss{color:var(--red);background:rgba(217,122,108,.1)}
-.result-tag.push{color:var(--amber);background:rgba(240,168,78,.1)}
+.leg-btns button{background:none;border:1px solid var(--hairline-bright);color:var(--text-dim);font-size:.7rem;padding:4px 10px;border-radius:99px;cursor:pointer;font-family:var(--sans)}
+.leg-btns button.active-win{border-color:var(--green);color:var(--green);background:rgba(61,220,132,.1)}
+.leg-btns button.active-loss{border-color:var(--red);color:var(--red);background:rgba(224,133,121,.1)}
+.leg-btns button.active-push{border-color:var(--green-deep);color:var(--green);background:rgba(31,143,82,.15)}
+.save-btn{margin-top:12px;background:var(--green);color:#07130d;border:none;font-weight:600;font-size:.8rem;padding:8px 16px;border-radius:7px;cursor:pointer;font-family:var(--sans)}
+.result-tag{font-size:.7rem;padding:2px 8px;border-radius:4px;flex-shrink:0;align-self:flex-start}
+.result-tag.win{color:var(--green);background:rgba(61,220,132,.1)}
+.result-tag.loss{color:var(--red);background:rgba(224,133,121,.1)}
+.result-tag.push{color:var(--green);background:rgba(31,143,82,.15)}
 </style>
 </head>
 <body>
@@ -1062,6 +1108,11 @@ h2{font-family:var(--serif);font-size:1.05rem;font-weight:600;margin:34px 0 14px
 function fmtPct(x){return x==null?"—":(x*100).toFixed(1)+"%"}
 function fmtAmerican(n){return n>0?"+"+n:""+n}
 function escapeHtml(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
+function sideArrow(side){
+  const isUp=side!=="Under";
+  const path=isUp?"M6 1 L11 9 L1 9 Z":"M6 9 L1 1 L11 1 Z";
+  return '<svg class="side-arrow '+(isUp?"up":"down")+'" viewBox="0 0 12 10" width="9" height="8"><path d="'+path+'"/></svg>';
+}
 
 async function loadStats(){
   const s = await fetch("/api/track-record").then(r=>r.json());
@@ -1085,7 +1136,7 @@ async function loadUngraded(){
     const row = document.createElement("div");
     row.className = "pick-row";
     const legsHtml = pick.legs.map(l =>
-      '<div class="leg-row"><span>'+escapeHtml(l.player+" "+l.side+" "+(l.point??"")+" — "+l.matchup)+'</span>'+
+      '<div class="leg-row"><span style="display:flex;align-items:center;gap:6px">'+sideArrow(l.side)+escapeHtml(l.player+" "+l.side+" "+(l.point??"")+" — "+l.matchup)+'</span>'+
       '<span class="leg-btns" data-leg="'+l.id+'">'+
         '<button data-call="win">Win</button><button data-call="loss">Loss</button><button data-call="push">Push</button>'+
       '</span></div>'
@@ -1128,5 +1179,3 @@ loadStats(); loadUngraded(); loadGraded();
 app.listen(PORT, () => {
   console.log(`Prop scanner running on port ${PORT}`);
 });
-
-
