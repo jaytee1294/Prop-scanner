@@ -1,6 +1,22 @@
 import express from "express";
 import fs from "fs";
 
+/**
+ * Node's global fetch has NO default timeout — an unresponsive server on
+ * the other end (odds API, weather API) would hang the request forever
+ * with no error, which looks exactly like "the app just stopped working."
+ * Every outbound fetch in this app goes through this instead.
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /* ────────────────────────────────────────────────────────────────────────
    ODDS MATH
 ──────────────────────────────────────────────────────────────────────── */
@@ -179,7 +195,7 @@ async function fetchEventWeather(venue, commenceTimeIso) {
       start_date: dateStr,
       end_date: dateStr,
     });
-    const res = await fetch(`https://api.open-meteo.com/v1/forecast?${params.toString()}`);
+    const res = await fetchWithTimeout(`https://api.open-meteo.com/v1/forecast?${params.toString()}`, {}, 5000);
     if (!res.ok) return null;
     const data = await res.json();
     const times = data?.hourly?.time;
@@ -232,7 +248,7 @@ function requireKey() {
 }
 
 async function getJson(url) {
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {}, 8000);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new OddsApiError(`Odds API request failed (${res.status}): ${body}`, res.status);
