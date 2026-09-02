@@ -446,13 +446,12 @@ function computePickScore(leg) {
   // probability scanner. legEV is a fraction (0.05 = +5%).
   breakdown.ev = Math.max(0, Math.min(40, Math.round((leg.legEV * 100 + 10) * 2)));
 
-  // No-vig probability sanity (0-15): rewards mid-range probabilities.
-  // Extreme long shots and near-locks are historically harder to price
-  // accurately, independent of what the EV math says.
-  breakdown.probabilityRange = Math.max(
-    0,
-    Math.round(15 * (1 - Math.abs(leg.trueProb - 0.4) / 0.4))
-  );
+  // No-vig probability sanity (0-15): only penalizes true longshots (thin
+  // data, harder for books to price accurately) — a safe favorite isn't a
+  // data-quality problem the way an extreme longshot is, so it keeps full
+  // points instead of being punished for being far from some "ideal" range.
+  breakdown.probabilityRange =
+    leg.trueProb >= 0.4 ? 15 : Math.max(0, Math.round(15 * (leg.trueProb - 0.1) / 0.3));
 
   // Market agreement (0-15): books clustering tightly = more trustworthy
   // consensus. No data (fewer than 2 book-pairs) earns zero, not a guess.
@@ -561,7 +560,7 @@ function applyLineMovement(legs) {
 const DEFAULT_OPTIONS = {
   targetAmericanOdds: 1000, toleranceLow: 700, toleranceHigh: 1600,
   minLegs: 3, maxLegs: 6, minBooksPerLeg: 2,
-  minTrueProb: 0.12, maxTrueProb: 0.72,
+  minTrueProb: 0.12, maxTrueProb: 0.90,
   minEV: 0,          // must be genuinely +EV by default — this is a value scanner, not a parlay generator
   minPickScore: 70,  // "Moderate Value" floor — below this, don't auto-recommend
   minAgreement: 0,   // 0 = not enforced by default (many legs lack 2+ book-pairs to even measure it)
