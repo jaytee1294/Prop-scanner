@@ -590,6 +590,13 @@ function pickWeightedByEdge(pool, rng) {
   return pool[pool.length - 1];
 }
 
+/** Count qualifying legs per market type — surfaces exactly why one market might be dominating results. */
+function marketBreakdownOf(pool) {
+  const counts = {};
+  for (const l of pool) counts[l.market] = (counts[l.market] || 0) + 1;
+  return counts;
+}
+
 function buildParlays(allLegs, options = {}) {
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const rng = Math.random;
@@ -612,20 +619,27 @@ function buildParlays(allLegs, options = {}) {
 
   if (pool.length < opts.minLegs) {
     return {
+      categories: { highestProbability: [], highestEV: [], bestRiskReward: [], longshot: [] },
       parlays: [],
       qualifyingLegsCount: pool.length,
       poolSizeBeforeFilters: allLegs.length,
+      marketBreakdown: marketBreakdownOf(pool),
       reason: "insufficient_qualifying_legs",
     };
   }
 
+  // Generate a broad set of valid 3-leg combos with NO odds-window constraint —
+  // categories below slice this same pool by whatever each one actually cares
+  // about (probability, EV, blended score, or proximity to a longshot target),
+  // rather than generating separately for each and biasing the search early.
   const seen = new Set();
   const results = [];
+  const legCount = 3;
 
-  for (let i = 0; i < opts.iterations && pool.length >= opts.minLegs; i++) {
-    const legCount = opts.minLegs + Math.floor(rng() * (opts.maxLegs - opts.minLegs + 1));
+  for (let i = 0; i < opts.iterations && pool.length >= legCount; i++) {
     const combo = [];
     const usedEvents = new Set();
+    const usedMarkets = new Set();
     let attempts = 0;
 
     while (combo.length < legCount && attempts < legCount * 15) {
@@ -633,18 +647,21 @@ function buildParlays(allLegs, options = {}) {
       const candidate = pickWeightedByEdge(pool, rng);
       if (combo.some((l) => l.id === candidate.id)) continue;
       if (!opts.allowSameEventLegs && usedEvents.has(candidate.eventId)) continue;
+      // Skip a repeat market type when a different one is still available in the
+      // pool — keeps a parlay from being three "total bases" legs just because
+      // that market happens to have the most candidate lines today.
+      if (usedMarkets.has(candidate.market) && pool.some((l) => !usedMarkets.has(l.market) && !usedEvents.has(l.eventId))) continue;
       combo.push(candidate);
       usedEvents.add(candidate.eventId);
+      usedMarkets.add(candidate.market);
     }
-    if (combo.length < opts.minLegs) continue;
-
-    const { american } = combinedAmerican(combo);
-    if (american < opts.toleranceLow || american > opts.toleranceHigh) continue;
+    if (combo.length < legCount) continue;
 
     const key = combo.map((l) => l.id).sort().join("|");
     if (seen.has(key)) continue;
     seen.add(key);
 
+    const { american } = combinedAmerican(combo);
     const trueProb = combineProbabilities(combo.map((l) => l.trueProb));
     const decimal = combineDecimalOdds(combo.map((l) => americanToDecimal(l.bestAmerican)));
     const ev = expectedValuePerDollar(trueProb, decimal);
@@ -659,15 +676,34 @@ function buildParlays(allLegs, options = {}) {
     });
   }
 
-  results.sort((a, b) => {
-    if (Math.abs(a.evPerDollar - b.evPerDollar) > 0.005) return b.evPerDollar - a.evPerDollar;
-    return Math.abs(a.combinedAmerican - opts.targetAmericanOdds) - Math.abs(b.combinedAmerican - opts.targetAmericanOdds);
-  });
+  const byProb = [...results].sort((a, b) => b.trueProbability - a.trueProbability);
+  const byEV = [...results].sort((a, b) => b.evPerDollar - a.evPerDollar);
+  const byScore = [...results].sort((a, b) => b.avgPickScore - a.avgPickScore || b.evPerDollar - a.evPerDollar);
+  const longshotPool = results.filter((r) => r.combinedAmerican >= opts.toleranceLow && r.combinedAmerican <= opts.toleranceHigh);
+  const byLongshot = [...longshotPool].sort((a, b) => b.evPerDollar - a.evPerDollar);
+
+  const dedupe = (list, n) => {
+    const out = [];
+    for (const r of list) {
+      if (out.length >= n) break;
+      out.push(r);
+    }
+    return out;
+  };
+
+  const categories = {
+    highestProbability: dedupe(byProb, 5),
+    highestEV: dedupe(byEV, 5),
+    bestRiskReward: dedupe(byScore, 5),
+    longshot: dedupe(byLongshot, 5),
+  };
 
   return {
-    parlays: results.slice(0, opts.resultCount),
+    categories,
+    parlays: categories.highestProbability, // default/legacy view
     qualifyingLegsCount: pool.length,
     poolSizeBeforeFilters: allLegs.length,
+    marketBreakdown: marketBreakdownOf(pool),
     reason: results.length ? null : "no_combo_in_odds_window",
   };
 }
@@ -915,21 +951,46 @@ app.get("/api/scan", async (req, res) => {
       return res.status(200).json({ parlays: [], scanned, apiQuota, message });
     }
     const buildResult = buildParlays(allLegs, filterOpts);
-    const withExplanations = buildResult.parlays.map((p) => ({ ...p, explanation: explainParlay(p) }));
-    logPicks(buildResult.parlays);
+
+    const explainAndAttach = (list) => list.map((p) => ({ ...p, explanation: explainParlay(p) }));
+    const categoriesWithExplanations = {
+      highestProbability: explainAndAttach(buildResult.categories.highestProbability),
+      highestEV: explainAndAttach(buildResult.categories.highestEV),
+      bestRiskReward: explainAndAttach(buildResult.categories.bestRiskReward),
+      longshot: explainAndAttach(buildResult.categories.longshot),
+    };
+
+    // Log every unique parlay actually shown across all categories, deduped by leg signature.
+    const allShown = [
+      ...categoriesWithExplanations.highestProbability,
+      ...categoriesWithExplanations.highestEV,
+      ...categoriesWithExplanations.bestRiskReward,
+      ...categoriesWithExplanations.longshot,
+    ];
+    const seenKeys = new Set();
+    const uniqueToLog = [];
+    for (const p of allShown) {
+      const key = p.legs.map((l) => l.id).sort().join("|");
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+      uniqueToLog.push(p);
+    }
+    logPicks(uniqueToLog);
 
     let message = null;
     if (buildResult.reason === "insufficient_qualifying_legs") {
       message = `NO QUALIFYING PARLAY — only ${buildResult.qualifyingLegsCount} of ${buildResult.poolSizeBeforeFilters} scanned props met your current quality thresholds (need at least 3). Loosen filters (lower Min Pick Score or Min EV) if you want to see more, or check back — the standards aren't being lowered automatically to force a result.`;
-    } else if (buildResult.reason === "no_combo_in_odds_window") {
-      message = `NO QUALIFYING PARLAY — ${buildResult.qualifyingLegsCount} props qualified on quality, but none combined into your target odds window (+${filterOpts.targetAmericanOdds ?? targetOdds} range). Try widening the target odds.`;
+    } else if (categoriesWithExplanations.longshot.length === 0) {
+      message = `No combo landed near your +${targetOdds} target specifically, so that category is empty below — but the highest-probability, highest-EV, and best risk/reward picks are still shown. Widen the target odds if you want a longshot near that number.`;
     }
 
     const payload = {
-      parlays: withExplanations,
+      categories: categoriesWithExplanations,
+      parlays: categoriesWithExplanations.highestProbability,
       scanned: { ...scanned, legsFound: allLegs.length },
       qualifyingLegsCount: buildResult.qualifyingLegsCount,
       poolSizeBeforeFilters: buildResult.poolSizeBeforeFilters,
+      marketBreakdown: buildResult.marketBreakdown,
       apiQuota,
       message,
       generatedAt: new Date().toISOString(),
@@ -1140,39 +1201,60 @@ function marketLabel(marketKey){
   return marketKey.replace(/^player_|^batter_|^pitcher_/,"").replace(/_/g," ");
 }
 
-function renderParlays(parlays){
-  resultsEl.innerHTML="";
-  if(!parlays.length){
-    resultsEl.innerHTML='<p class="empty-state">No combos landed near that target with the current pool. Try widening the target odds or adding more sports.</p>';
-    return;
-  }
-  parlays.forEach((p,i)=>{
-    const row=document.createElement("article");
-    row.className="parlay-row"+(i===0?" top":"");
-    const legsHtml=p.legs.map(l=>'<li>'+sideArrow(l.side)+'<b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??'')+' '+marketLabel(l.market))+'</li>').join("");
-    const evPct=(p.evPerDollar*100).toFixed(1);
-    const evClass=p.evPerDollar>=-0.05?"pos":"neg";
-    const scoreClass=p.avgPickScore>=90?"pos":p.avgPickScore>=70?"":"neg";
-    row.innerHTML=
-      '<div class="rank">'+String(i+1).padStart(2,"0")+'</div>'+
-      '<div class="parlay-body">'+
-        '<h3>'+p.legs.length+'-leg parlay</h3>'+
-        '<ul class="leg-list">'+legsHtml+'</ul>'+
-        '<button class="toggle-detail">Show research</button>'+
-        '<div class="parlay-detail">'+escapeHtml(p.explanation)+'</div>'+
-      '</div>'+
-      '<div class="parlay-figures">'+
-        '<div class="odds-figure">'+formatAmerican(p.combinedAmerican)+'</div>'+
-        '<div class="ev-tag '+evClass+'">'+(evPct>=0?"+":"")+evPct+'% EV</div>'+
-        '<div class="ev-tag '+scoreClass+'">Pick Score '+p.avgPickScore+'</div>'+
-      '</div>';
-    row.querySelector(".toggle-detail").addEventListener("click",(e)=>{
-      const detail=row.querySelector(".parlay-detail");
-      const open=detail.classList.toggle("open");
-      e.target.textContent=open?"Hide research":"Show research";
-    });
-    resultsEl.appendChild(row);
+function buildParlayRow(p,i){
+  const row=document.createElement("article");
+  row.className="parlay-row"+(i===0?" top":"");
+  const legsHtml=p.legs.map(l=>'<li>'+sideArrow(l.side)+'<b>'+escapeHtml(l.player)+'</b> '+escapeHtml(l.side+' '+(l.point??'')+' '+marketLabel(l.market))+'</li>').join("");
+  const evPct=(p.evPerDollar*100).toFixed(1);
+  const evClass=p.evPerDollar>=-0.05?"pos":"neg";
+  const scoreClass=p.avgPickScore>=90?"pos":p.avgPickScore>=70?"":"neg";
+  row.innerHTML=
+    '<div class="rank">'+String(i+1).padStart(2,"0")+'</div>'+
+    '<div class="parlay-body">'+
+      '<h3>'+p.legs.length+'-leg parlay</h3>'+
+      '<ul class="leg-list">'+legsHtml+'</ul>'+
+      '<button class="toggle-detail">Show research</button>'+
+      '<div class="parlay-detail">'+escapeHtml(p.explanation)+'</div>'+
+    '</div>'+
+    '<div class="parlay-figures">'+
+      '<div class="odds-figure">'+formatAmerican(p.combinedAmerican)+'</div>'+
+      '<div class="ev-tag '+evClass+'">'+(evPct>=0?"+":"")+evPct+'% EV</div>'+
+      '<div class="ev-tag '+scoreClass+'">Pick Score '+p.avgPickScore+'</div>'+
+    '</div>';
+  row.querySelector(".toggle-detail").addEventListener("click",(e)=>{
+    const detail=row.querySelector(".parlay-detail");
+    const open=detail.classList.toggle("open");
+    e.target.textContent=open?"Hide research":"Show research";
   });
+  return row;
+}
+function renderSection(title,subtitle,parlays,emptyText){
+  const section=document.createElement("section");
+  section.style.marginTop="30px";
+  const h2=document.createElement("h2");
+  h2.textContent=title;
+  h2.style.cssText="font-family:var(--serif);font-size:1.15rem;margin:0 0 4px;color:var(--text)";
+  const sub=document.createElement("p");
+  sub.textContent=subtitle;
+  sub.style.cssText="color:var(--text-dim);font-size:.8rem;margin:0 0 14px";
+  section.appendChild(h2);
+  section.appendChild(sub);
+  if(!parlays.length){
+    const empty=document.createElement("p");
+    empty.className="empty-state";
+    empty.textContent=emptyText;
+    section.appendChild(empty);
+  } else {
+    parlays.forEach((p,i)=>section.appendChild(buildParlayRow(p,i)));
+  }
+  return section;
+}
+function renderCategories(categories){
+  resultsEl.innerHTML="";
+  resultsEl.appendChild(renderSection("Highest Probability","Best chance to actually hit — expect lower payouts than a longshot target.",categories.highestProbability,"No combos met the current quality thresholds."));
+  resultsEl.appendChild(renderSection("Highest EV","Best modeled value per dollar staked, regardless of payout size.",categories.highestEV,"No combos met the current quality thresholds."));
+  resultsEl.appendChild(renderSection("Best Risk/Reward","Balanced by overall Pick Score — a blend of EV, agreement, and data quality.",categories.bestRiskReward,"No combos met the current quality thresholds."));
+  resultsEl.appendChild(renderSection("Longshot (near your target)","Closest to the +"+targetOddsInput.value.replace(/[^0-9]/g,"")+" target you set above.",categories.longshot,"No combo landed near your target odds this scan — try widening it."));
 }
 
 async function scan(){
@@ -1191,15 +1273,28 @@ async function scan(){
       tickerEl.innerHTML='<span>—</span>';
       return;
     }
-    if(data.message){resultsEl.innerHTML='<p class="empty-state">'+escapeHtml(data.message)+'</p>'}
-    else{renderParlays(data.parlays)}
-    const count=data.parlays?data.parlays.length:0;
+    const hasAnyCategoryResults=data.categories&&Object.values(data.categories).some(c=>c.length);
+    if(data.message&&!hasAnyCategoryResults){
+      resultsEl.innerHTML='<p class="empty-state">'+escapeHtml(data.message)+'</p>';
+    } else {
+      renderCategories(data.categories||{highestProbability:[],highestEV:[],bestRiskReward:[],longshot:[]});
+      if(data.message){
+        const note=document.createElement("p");
+        note.className="empty-state";
+        note.style.cssText="text-align:left;margin-top:0;margin-bottom:20px";
+        note.textContent=data.message;
+        resultsEl.insertBefore(note,resultsEl.firstChild);
+      }
+    }
+    const count=data.categories?Object.values(data.categories).reduce((a,c)=>a+c.length,0):0;
     const scanned=data.scanned||{};
     tickerEl.innerHTML='<span><b>'+count+'</b> parlays found</span><span>'+(scanned.events??0)+' events scanned</span><span>'+(scanned.legsFound??0)+' legs found</span>'+(data.cached?'<span>cached</span>':'<span>live</span>');
     const books=scanned.booksObserved||[];
     const q=data.apiQuota;
     const quotaText=q&&q.remaining!=null?(" · Odds API: "+q.remaining+" requests remaining"):"";
-    scanMetaEl.textContent=(books.length?("Books this scan: "+books.join(", ")):"")+quotaText;
+    const mb=data.marketBreakdown;
+    const marketText=mb?(" · Qualifying legs by market: "+Object.entries(mb).map(([k,v])=>k.replace(/^player_|^batter_|^pitcher_/,"").replace(/_/g," ")+" "+v).join(", ")):"";
+    scanMetaEl.textContent=(books.length?("Books this scan: "+books.join(", ")):"")+quotaText+marketText;
   }catch(err){
     resultsEl.innerHTML='<p class="empty-state">Scan failed: '+escapeHtml(err.message)+'</p>';
   }finally{
