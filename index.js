@@ -1122,7 +1122,7 @@ h1{font-family:var(--serif);font-weight:600;font-size:clamp(1.7rem,4.6vw,2.35rem
 .empty-state{color:var(--text-dim);padding:56px 20px;text-align:center;border:1px dashed var(--hairline);border-radius:10px;margin-top:20px}
 
 /* result rows: left accent bar, not identical bordered cards */
-.parlay-row{display:flex;gap:18px;padding:20px 4px 20px 18px;border-left:2px solid var(--hairline);border-bottom:1px solid var(--hairline);position:relative}
+.parlay-row{display:flex;flex-wrap:wrap;gap:18px;padding:20px 4px 20px 18px;border-left:2px solid var(--hairline);border-bottom:1px solid var(--hairline);position:relative}
 .parlay-row.top{border-left:3px solid var(--amber);background:linear-gradient(90deg,rgba(240,168,78,.07),transparent 60%)}
 .rank{font-family:var(--mono);font-weight:600;font-size:.95rem;color:var(--text-dim);width:26px;flex-shrink:0;padding-top:3px}
 .parlay-row.top .rank{color:var(--amber)}
@@ -1136,8 +1136,14 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.1rem;margin:0 0 10px;col
 .side-arrow.down path{fill:var(--red)}
 .leg-list li b{color:var(--text);font-weight:500}
 .toggle-detail{background:none;border:none;color:var(--amber);font-size:.8rem;cursor:pointer;padding:0;font-family:var(--sans);font-weight:500}
-.parlay-detail{display:none;margin-top:12px;padding:14px 16px;background:var(--ink-raised);border-radius:8px;border:1px solid var(--hairline);white-space:pre-line;font-size:.84rem;color:var(--text-dim)}
+.parlay-detail{display:none;flex-basis:100%;width:100%;margin-top:14px;padding:16px 20px;background:var(--ink-raised);border-radius:8px;border:1px solid var(--hairline);font-size:.85rem;color:var(--text-dim)}
 .parlay-detail.open{display:block}
+.detail-summary{color:var(--text);font-size:.87rem;font-weight:500;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--hairline);line-height:1.5}
+.detail-leg{display:flex;gap:10px;padding:11px 0;border-top:1px solid var(--hairline)}
+.detail-leg:first-of-type{border-top:none;padding-top:0}
+.detail-leg .side-arrow{margin-top:4px;flex-shrink:0}
+.detail-leg .leg-text{line-height:1.6}
+.detail-caveat{margin-top:14px;padding-top:14px;border-top:1px solid var(--hairline);font-size:.76rem;color:var(--text-dim);opacity:.75;line-height:1.5}
 .parlay-figures{text-align:right;flex-shrink:0;padding-top:2px}
 .odds-figure{font-family:var(--mono);font-weight:600;font-size:1.3rem;color:var(--amber)}
 .parlay-row.top .odds-figure{font-size:1.7rem}
@@ -1204,6 +1210,24 @@ function sideArrow(side){
   const path=isUp?"M6 1 L11 9 L1 9 Z":"M6 9 L1 1 L11 1 Z";
   return '<svg class="side-arrow '+(isUp?"up":"down")+'" viewBox="0 0 12 10" width="9" height="8"><path d="'+path+'"/></svg>';
 }
+function renderDetail(p){
+  // explainParlay's line order: [0]=summary, [1..legCount]=one bullet per leg
+  // (same order as p.legs), then a trailing caveat line.
+  const lines=p.explanation.split("\n");
+  const legCount=p.legs.length;
+  let html="";
+  lines.forEach((line,idx)=>{
+    const legIdx=idx-1;
+    if(idx===0){
+      html+='<div class="detail-summary">'+escapeHtml(line)+'</div>';
+    } else if(legIdx>=0 && legIdx<legCount && line.startsWith("• ")){
+      html+='<div class="detail-leg">'+sideArrow(p.legs[legIdx].side)+'<span class="leg-text">'+escapeHtml(line.slice(2))+'</span></div>';
+    } else {
+      html+='<div class="detail-caveat">'+escapeHtml(line)+'</div>';
+    }
+  });
+  return html;
+}
 function marketLabel(marketKey){
   return marketKey.replace(/^player_|^batter_|^pitcher_/,"").replace(/_/g," ");
 }
@@ -1227,13 +1251,13 @@ function renderParlays(parlays){
         '<h3>'+p.legs.length+'-leg parlay</h3>'+
         '<ul class="leg-list">'+legsHtml+'</ul>'+
         '<button class="toggle-detail">Show research</button>'+
-        '<div class="parlay-detail">'+escapeHtml(p.explanation)+'</div>'+
       '</div>'+
       '<div class="parlay-figures">'+
         '<div class="odds-figure">'+formatAmerican(p.combinedAmerican)+'</div>'+
         '<div class="ev-tag '+evClass+'">'+(evPct>=0?"+":"")+evPct+'% EV</div>'+
         '<div class="ev-tag '+scoreClass+'">Pick Score '+p.avgPickScore+'</div>'+
-      '</div>';
+      '</div>'+
+      '<div class="parlay-detail">'+renderDetail(p)+'</div>';
     row.querySelector(".toggle-detail").addEventListener("click",(e)=>{
       const detail=row.querySelector(".parlay-detail");
       const open=detail.classList.toggle("open");
