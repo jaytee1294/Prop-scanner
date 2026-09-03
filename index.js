@@ -1168,11 +1168,11 @@ h3{font-family:var(--serif);font-weight:600;font-size:1.1rem;margin:0 0 10px;col
 </header>
 
 <section class="controls">
-<div class="control-group" id="sport-toggles" aria-label="Sports to include"></div>
+<div class="control-group" id="sport-toggles" aria-label="Sports to include"><span style="color:var(--text-dim);font-size:.85rem">Loading sports…</span></div>
 <div class="control-target"><label for="target-odds">Target</label><input type="text" id="target-odds" value="+1000" /></div>
 <div class="control-target"><label for="min-score">Min Pick Score</label><input type="text" id="min-score" value="70" style="width:44px" /></div>
 <div class="control-target"><label for="when-select">When</label><select id="when-select"><option value="36">Today</option><option value="72">Next 3 days</option><option value="all">All upcoming</option></select></div>
-<button id="scan-btn" class="scan-btn">Scan market</button>
+<button id="scan-btn" class="scan-btn" disabled>Loading…</button>
 </section>
 <p class="scan-meta" id="scan-meta" style="margin-top:10px"></p>
 
@@ -1186,20 +1186,27 @@ const sportTogglesEl=document.getElementById("sport-toggles"),resultsEl=document
 let activeSports=new Set();
 
 async function loadSports(){
-  const sports=await fetch("/api/sports").then(r=>r.json());
-  sportTogglesEl.innerHTML="";
-  sports.forEach(({key,label})=>{
-    activeSports.add(key);
-    const chip=document.createElement("span");
-    chip.className="sport-chip active";
-    chip.innerHTML='<span class="dot"></span>'+label;
-    chip.dataset.key=key;
-    chip.addEventListener("click",()=>{
-      if(activeSports.has(key)){activeSports.delete(key);chip.classList.remove("active")}
-      else{activeSports.add(key);chip.classList.add("active")}
+  try{
+    const sports=await fetch("/api/sports").then(r=>r.json());
+    sportTogglesEl.innerHTML="";
+    sports.forEach(({key,label})=>{
+      activeSports.add(key);
+      const chip=document.createElement("span");
+      chip.className="sport-chip active";
+      chip.innerHTML='<span class="dot"></span>'+label;
+      chip.dataset.key=key;
+      chip.addEventListener("click",()=>{
+        if(activeSports.has(key)){activeSports.delete(key);chip.classList.remove("active")}
+        else{activeSports.add(key);chip.classList.add("active")}
+      });
+      sportTogglesEl.appendChild(chip);
     });
-    sportTogglesEl.appendChild(chip);
-  });
+    scanBtn.disabled=false;
+    scanBtn.textContent="Scan market";
+  }catch(err){
+    sportTogglesEl.innerHTML='<span style="color:var(--text-dim);font-size:.85rem">Couldn\'t load sports list — reload the page.</span>';
+    scanBtn.textContent="Reload the page";
+  }
 }
 
 function parseTargetOdds(raw){const n=parseInt(raw.replace(/[^0-9-]/g,""),10);return Number.isFinite(n)?Math.abs(n):1000}
